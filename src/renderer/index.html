@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Anton</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="activity-bar" aria-label="Activity">
+        <button class="activity active" data-view="explorer" title="Explorer">▦</button>
+        <button class="activity" data-view="search" title="Search">⌕</button>
+        <button class="activity" data-view="scm" title="Source Control">⑂</button>
+        <button class="activity" data-view="run" title="Run and Debug">▷</button>
+        <button class="activity" data-view="extensions" title="Extensions">□</button>
+        <button class="activity bottom" data-view="settings" title="Settings">⚙</button>
+      </aside>
+
+      <section class="sidebar">
+        <div class="brand">
+          <div class="mark">A</div>
+          <div>
+            <h1>Anton</h1>
+            <p id="workspaceName">No folder open</p>
+          </div>
+        </div>
+
+        <section class="side-view active" id="view-explorer">
+          <div class="section-head">
+            <span>Explorer</span>
+            <div class="icon-row">
+              <button id="openWorkspace" title="Open folder">＋</button>
+              <button id="refreshWorkspace" title="Refresh">↻</button>
+            </div>
+          </div>
+          <div id="fileTree" class="tree empty">Open a folder to show files.</div>
+          <div id="explorerSectionResize" class="resize-handle horizontal sidebar-section-resize" title="Resize Explorer sections"></div>
+          <div class="section-head compact"><span>Outline</span></div>
+          <div id="outline" class="outline empty">No symbols.</div>
+        </section>
+
+        <section class="side-view" id="view-search">
+          <div class="section-head"><span>Search</span></div>
+          <input id="searchInput" class="text-input" placeholder="Search workspace" />
+          <button id="searchButton" class="wide-button">Search</button>
+          <div id="searchResults" class="results empty">No search yet.</div>
+        </section>
+
+        <section class="side-view" id="view-scm">
+          <div class="section-head">
+            <span>Source Control</span>
+            <button id="refreshGit" title="Refresh Git">↻</button>
+          </div>
+          <div id="gitBranch" class="pill">No workspace</div>
+          <div id="gitChanges" class="results empty">No changes loaded.</div>
+        </section>
+
+        <section class="side-view" id="view-run">
+          <div class="section-head"><span>Run and Debug</span></div>
+          <button id="runCurrent" class="wide-button">Run current file</button>
+          <button id="runTests" class="wide-button secondary">Run tests</button>
+          <div class="note">Breakpoints, variable watch, launch configs, and adapters are scaffolded but not a full debugger yet.</div>
+        </section>
+
+        <section class="side-view" id="view-extensions">
+          <div class="section-head"><span>Extensions</span></div>
+          <div class="extension-card">
+            <strong>Anton extension host</strong>
+            <p>Marketplace-compatible extensions are not implemented yet. This panel is ready for local plugin registration.</p>
+          </div>
+          <div class="extension-card">
+            <strong>Language services</strong>
+            <p>Monaco gives built-in JS, TS, JSON, HTML, CSS, and Markdown editing. External LSP wiring is the next backend step.</p>
+          </div>
+        </section>
+
+        <section class="side-view" id="view-settings">
+          <div class="section-head"><span>Settings</span></div>
+          <label class="setting-row"><input id="autosaveToggle" type="checkbox" checked /> Autosave</label>
+          <label class="setting-row"><input id="minimapToggle" type="checkbox" checked /> Minimap</label>
+          <label class="setting-row"><input id="wordWrapToggle" type="checkbox" /> Word wrap</label>
+          <label class="field-label">Font size <input id="fontSizeInput" type="number" min="11" max="24" value="14" /></label>
+        </section>
+      </section>
+
+      <div id="sidebarResize" class="resize-handle vertical" title="Resize sidebar"></div>
+
+      <section class="workspace">
+        <header class="topbar">
+          <div id="tabs" class="tabs"></div>
+          <button id="commandButton" class="command-chip">Command Palette</button>
+          <div class="model-box">
+            <select id="modelSelect"></select>
+            <button id="refreshModels" title="Refresh models">↻</button>
+          </div>
+        </header>
+
+        <div class="breadcrumb" id="breadcrumb">Anton</div>
+
+        <section class="editor-wrap">
+          <div class="editor-surface">
+            <div id="editor"></div>
+            <div id="editorEmpty" class="editor-empty">
+              <div class="empty-title">No file open</div>
+              <div class="empty-subtitle">Open a file from Explorer or use the command palette.</div>
+              <button id="emptyOpenFile">Open file</button>
+            </div>
+          </div>
+          <div id="aiResize" class="resize-handle vertical" title="Resize Anton AI"></div>
+          <aside class="ai-pane">
+            <div class="pane-title">
+              <span>Anton AI</span>
+              <span id="activeModel">No model</span>
+            </div>
+            <div id="messages" class="messages">
+              <div class="message system">Local Ollama assistant. It can use the active file and workspace file names as context.</div>
+            </div>
+            <div class="prompt-box">
+              <textarea id="prompt" spellcheck="true" placeholder="Ask Anton about this code..."></textarea>
+              <button id="sendPrompt" class="primary-button">Send</button>
+            </div>
+          </aside>
+        </section>
+
+        <div id="panelResize" class="resize-handle horizontal" title="Resize panel"></div>
+
+        <section class="panel">
+          <div class="panel-tabs">
+            <button class="panel-tab active" data-panel="terminal">Terminal</button>
+            <button class="panel-tab" data-panel="problems">Problems</button>
+            <button class="panel-tab" data-panel="output">Output</button>
+          </div>
+          <div class="panel-body active" id="panel-terminal">
+            <div class="terminal-tabs">
+              <div id="terminalTabs" class="terminal-tab-list"></div>
+              <button id="newTerminal" class="terminal-new" title="New terminal">＋</button>
+            </div>
+            <pre id="terminalOutput"></pre>
+            <div class="terminal-input">
+              <span id="terminalPrompt">$</span>
+              <input id="terminalCommand" placeholder="Run command in workspace" />
+              <button id="terminalStop" title="Stop running process" disabled>Stop</button>
+            </div>
+          </div>
+          <div class="panel-body" id="panel-problems">
+            <div id="problems" class="empty">No diagnostics reported by Monaco.</div>
+          </div>
+          <div class="panel-body" id="panel-output">
+            <pre id="outputLog">Anton started.</pre>
+          </div>
+        </section>
+
+        <footer class="statusbar">
+          <span id="statusLeft">Ready</span>
+          <span id="statusRight">Ln 1, Col 1</span>
+        </footer>
+      </section>
+    </main>
+
+    <div id="palette" class="palette hidden">
+      <input id="paletteInput" placeholder="Type a command" />
+      <div id="paletteResults"></div>
+    </div>
+    <div id="contextMenu" class="context-menu hidden"></div>
+
+    <script src="../../node_modules/monaco-editor/min/vs/loader.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

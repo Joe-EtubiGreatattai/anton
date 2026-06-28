@@ -1,0 +1,30 @@
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('anton', {
+  openWorkspace: () => ipcRenderer.invoke('workspace:open'),
+  refreshWorkspace: () => ipcRenderer.invoke('workspace:refresh'),
+  openFileDialog: () => ipcRenderer.invoke('dialog:openFile'),
+  readFile: (filePath) => ipcRenderer.invoke('file:read', filePath),
+  saveFile: (payload) => ipcRenderer.invoke('file:save', payload),
+  createFile: (payload) => ipcRenderer.invoke('file:create', payload),
+  deleteFile: (filePath) => ipcRenderer.invoke('file:delete', filePath),
+  renameFile: (payload) => ipcRenderer.invoke('file:rename', payload),
+  duplicateFile: (filePath) => ipcRenderer.invoke('file:duplicate', filePath),
+  revealFile: (filePath) => ipcRenderer.invoke('file:reveal', filePath),
+  writeClipboard: (text) => ipcRenderer.invoke('clipboard:write', text),
+  openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
+  searchWorkspace: (query) => ipcRenderer.invoke('workspace:search', query),
+  gitStatus: () => ipcRenderer.invoke('git:status'),
+  createTerminal: (payload) => ipcRenderer.invoke('terminal:create', payload),
+  useWorkspaceRootTerminal: (payload) => ipcRenderer.invoke('terminal:useWorkspaceRoot', payload),
+  runTerminal: (payload) => ipcRenderer.invoke('terminal:run', payload),
+  killTerminal: (payload) => ipcRenderer.invoke('terminal:kill', payload),
+  listModels: () => ipcRenderer.invoke('ollama:listModels'),
+  generate: (payload) => ipcRenderer.invoke('ollama:generate', payload),
+  onWorkspaceChanged: (callback) => ipcRenderer.on('workspace:changed', (_event, payload) => callback(payload)),
+  onTerminalData: (callback) => ipcRenderer.on('terminal:data', (_event, payload) => callback(payload)),
+  onTerminalClear: (callback) => ipcRenderer.on('terminal:clear', (_event, payload) => callback(payload)),
+  onTerminalCwd: (callback) => ipcRenderer.on('terminal:cwd', (_event, payload) => callback(payload)),
+  onTerminalState: (callback) => ipcRenderer.on('terminal:state', (_event, payload) => callback(payload)),
+  onOllamaToken: (callback) => ipcRenderer.on('ollama:token', (_event, payload) => callback(payload))
+});
