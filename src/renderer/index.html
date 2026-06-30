@@ -9,17 +9,16 @@
   <body>
     <main class="shell">
       <aside class="activity-bar" aria-label="Activity">
-        <button class="activity active" data-view="explorer" title="Explorer">▦</button>
-        <button class="activity" data-view="search" title="Search">⌕</button>
-        <button class="activity" data-view="scm" title="Source Control">⑂</button>
-        <button class="activity" data-view="run" title="Run and Debug">▷</button>
-        <button class="activity" data-view="extensions" title="Extensions">□</button>
-        <button class="activity bottom" data-view="settings" title="Settings">⚙</button>
+        <button class="activity active" data-view="explorer" data-icon="files" title="Explorer"></button>
+        <button class="activity" data-view="search" data-icon="search" title="Search"></button>
+        <button id="scmActivity" class="activity" data-view="scm" data-icon="branch" title="Source Control"></button>
+        <button class="activity" data-view="run" data-icon="play" title="Run and Debug"></button>
+        <button class="activity" data-view="extensions" data-icon="blocks" title="Extensions"></button>
+        <button class="activity bottom" data-view="settings" data-icon="settings" title="Settings"></button>
       </aside>
 
       <section class="sidebar">
         <div class="brand">
-          <div class="mark">A</div>
           <div>
             <h1>Anton</h1>
             <p id="workspaceName">No folder open</p>
@@ -30,8 +29,8 @@
           <div class="section-head">
             <span>Explorer</span>
             <div class="icon-row">
-              <button id="openWorkspace" title="Open folder">＋</button>
-              <button id="refreshWorkspace" title="Refresh">↻</button>
+              <button id="openWorkspace" data-icon="folder-plus" title="Open folder"></button>
+              <button id="refreshWorkspace" data-icon="refresh" title="Refresh"></button>
             </div>
           </div>
           <div id="fileTree" class="tree empty">Open a folder to show files.</div>
@@ -42,18 +41,68 @@
 
         <section class="side-view" id="view-search">
           <div class="section-head"><span>Search</span></div>
-          <input id="searchInput" class="text-input" placeholder="Search workspace" />
-          <button id="searchButton" class="wide-button">Search</button>
+          <div class="search-bar">
+            <input id="searchInput" class="text-input" placeholder="Search workspace" />
+            <button id="searchButton" class="icon-button" data-icon="search" title="Search"></button>
+          </div>
           <div id="searchResults" class="results empty">No search yet.</div>
         </section>
 
         <section class="side-view" id="view-scm">
           <div class="section-head">
             <span>Source Control</span>
-            <button id="refreshGit" title="Refresh Git">↻</button>
+            <div class="icon-row">
+              <button id="refreshGit" data-icon="refresh" title="Refresh Git"></button>
+              <button id="gitSync" data-icon="sync" title="Sync"></button>
+            </div>
           </div>
-          <div id="gitBranch" class="pill">No workspace</div>
-          <div id="gitChanges" class="results empty">No changes loaded.</div>
+          <div id="gitEmpty" class="scm-empty hidden">No Git repository.</div>
+          <div id="gitPanel" class="scm-panel">
+            <select id="gitRepoSelect" class="text-input scm-repo-select" title="Repository"></select>
+            <div id="gitRepositories" class="scm-repositories"></div>
+            <div class="scm-repo-card">
+              <div>
+                <div id="gitBranchName" class="scm-branch">No workspace</div>
+                <div id="gitMeta" class="scm-meta">Open a Git repository.</div>
+              </div>
+              <div class="scm-repo-actions">
+                <button id="gitPull" data-icon="arrow-down" title="Pull"></button>
+                <button id="gitPush" data-icon="arrow-up" title="Push"></button>
+              </div>
+            </div>
+            <div class="scm-branch-row">
+              <select id="gitBranchSelect" class="text-input"></select>
+              <button id="gitNewBranch" data-icon="plus" title="Create branch"></button>
+            </div>
+            <textarea id="gitCommitMessage" class="scm-commit-input" placeholder="Message"></textarea>
+            <button id="gitCommitButton" class="wide-button scm-commit-button" disabled>Commit</button>
+            <div class="scm-action-strip">
+              <button id="gitStageAll" data-icon="plus" title="Stage all">Stage all</button>
+              <button id="gitUnstageAll" data-icon="minus" title="Unstage all">Unstage all</button>
+              <button id="gitDiscardAll" data-icon="trash" title="Discard all">Discard all</button>
+            </div>
+            <div class="scm-sections">
+              <section id="gitConflictsSection" class="scm-section hidden">
+                <div class="scm-section-title"><span>Merge Changes</span><span id="gitConflictsCount">0</span></div>
+                <div id="gitConflicts"></div>
+              </section>
+              <section class="scm-section">
+                <div class="scm-section-title"><span>Changes</span><span id="gitUnstagedCount">0</span></div>
+                <div id="gitUnstaged"></div>
+              </section>
+              <section class="scm-section">
+                <div class="scm-section-title"><span>Staged Changes</span><span id="gitStagedCount">0</span></div>
+                <div id="gitStaged"></div>
+              </section>
+              <section class="scm-section">
+                <div class="scm-section-title">
+                  <span>Stashes</span>
+                  <button id="gitStash" data-icon="archive" title="Stash changes"></button>
+                </div>
+                <div id="gitStashes"></div>
+              </section>
+            </div>
+          </div>
         </section>
 
         <section class="side-view" id="view-run">
@@ -80,7 +129,29 @@
           <label class="setting-row"><input id="autosaveToggle" type="checkbox" checked /> Autosave</label>
           <label class="setting-row"><input id="minimapToggle" type="checkbox" checked /> Minimap</label>
           <label class="setting-row"><input id="wordWrapToggle" type="checkbox" /> Word wrap</label>
+          <label class="setting-row"><input id="keepAwakeToggle" type="checkbox" /> Prevent sleep</label>
           <label class="field-label">Font size <input id="fontSizeInput" type="number" min="11" max="24" value="14" /></label>
+          <div class="settings-divider"></div>
+          <div class="section-head compact"><span>Models</span></div>
+          <div class="model-manager">
+            <div class="model-pull-row">
+              <input id="modelNameInput" class="text-input" placeholder="qwen2.5-coder:3b" />
+              <button id="pullModel" title="Download model"><span data-icon="download"></span></button>
+            </div>
+            <div id="modelProgress" class="model-progress hidden">
+              <div class="model-progress-top">
+                <span id="modelProgressStatus">Waiting</span>
+                <span id="modelProgressPercent">0%</span>
+              </div>
+              <div class="model-progress-bar"><span id="modelProgressFill"></span></div>
+            </div>
+            <div id="modelList" class="model-list empty">No models loaded.</div>
+            <div class="model-catalog-head">
+              <span>Available downloads</span>
+              <button id="refreshCatalog" title="Refresh available models"><span data-icon="refresh"></span></button>
+            </div>
+            <div id="modelCatalog" class="model-catalog empty">Loading available models...</div>
+          </div>
         </section>
       </section>
 
@@ -92,7 +163,7 @@
           <button id="commandButton" class="command-chip">Command Palette</button>
           <div class="model-box">
             <select id="modelSelect"></select>
-            <button id="refreshModels" title="Refresh models">↻</button>
+            <button id="refreshModels" data-icon="refresh" title="Refresh models"></button>
           </div>
         </header>
 
@@ -101,22 +172,30 @@
         <section class="editor-wrap">
           <div class="editor-surface">
             <div id="editor"></div>
+            <div id="diffEditor" class="hidden"></div>
             <div id="editorEmpty" class="editor-empty">
               <div class="empty-title">No file open</div>
               <div class="empty-subtitle">Open a file from Explorer or use the command palette.</div>
-              <button id="emptyOpenFile">Open file</button>
+              <button id="emptyOpenFile"><span data-icon="folder-open"></span><span>Open folder</span></button>
             </div>
           </div>
           <div id="aiResize" class="resize-handle vertical" title="Resize Anton AI"></div>
           <aside class="ai-pane">
             <div class="pane-title">
               <span>Anton AI</span>
-              <span id="activeModel">No model</span>
+              <div class="pane-title-actions">
+                <button id="planWorkBtn" data-icon="list-checks" title="Plan work" class="icon-button"></button>
+                <button id="chatHistoryBtn" data-icon="clock" title="Chat history" class="icon-button"></button>
+                <button id="newChatBtn" data-icon="plus" title="New chat" class="icon-button"></button>
+                <span id="activeModel">No model</span>
+              </div>
             </div>
+            <div id="aiLoader" class="ai-loader-bar hidden"></div>
             <div id="messages" class="messages">
               <div class="message system">Local Ollama assistant. It can use the active file and workspace file names as context.</div>
             </div>
             <div class="prompt-box">
+              <div id="mentionMenu" class="mention-menu hidden"></div>
               <textarea id="prompt" spellcheck="true" placeholder="Ask Anton about this code..."></textarea>
               <button id="sendPrompt" class="primary-button">Send</button>
             </div>
@@ -134,13 +213,13 @@
           <div class="panel-body active" id="panel-terminal">
             <div class="terminal-tabs">
               <div id="terminalTabs" class="terminal-tab-list"></div>
-              <button id="newTerminal" class="terminal-new" title="New terminal">＋</button>
+              <button id="newTerminal" class="terminal-new" data-icon="plus" title="New terminal"></button>
             </div>
             <pre id="terminalOutput"></pre>
             <div class="terminal-input">
               <span id="terminalPrompt">$</span>
               <input id="terminalCommand" placeholder="Run command in workspace" />
-              <button id="terminalStop" title="Stop running process" disabled>Stop</button>
+              <button id="terminalStop" title="Stop running process" disabled><span data-icon="square"></span><span>Stop</span></button>
             </div>
           </div>
           <div class="panel-body" id="panel-problems">
@@ -163,6 +242,14 @@
       <div id="paletteResults"></div>
     </div>
     <div id="contextMenu" class="context-menu hidden"></div>
+
+    <div id="historyPanel" class="history-panel hidden">
+      <div class="history-header">
+        <span>Chat History</span>
+        <button id="historyClose" class="icon-button" data-icon="x" title="Close"></button>
+      </div>
+      <div id="historyList" class="history-list"></div>
+    </div>
 
     <script src="../../node_modules/monaco-editor/min/vs/loader.js"></script>
     <script src="./app.js"></script>

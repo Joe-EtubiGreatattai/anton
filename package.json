@@ -14,8 +14,10 @@
   "build": {
     "appId": "local.anton.ide",
     "productName": "Anton",
+    "icon": "build/icon.icns",
     "mac": {
       "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
       "target": [
         "dmg",
         "zip"
@@ -23,6 +25,7 @@
     },
     "files": [
       "src/**/*",
+      "build/icon.icns",
       "package.json"
     ]
   },

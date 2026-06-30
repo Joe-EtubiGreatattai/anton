@@ -30,4 +30,3 @@ http://localhost:11434
 ```
 
 Install or switch models in Ollama, then use the model dropdown in Anton.
-# anton
