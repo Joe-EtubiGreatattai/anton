@@ -9,7 +9,8 @@ const state = {
     minimap: true,
     wordWrap: false,
     fontSize: 14,
-    keepAwake: false
+    keepAwake: false,
+    agentMode: true
   },
   lastAiResponse: '',
   terminals: [],
@@ -33,7 +34,15 @@ const state = {
   mentionCandidates: [],
   mentionActiveIndex: 0,
   gitBusy: false,
-  diffEditor: null
+  diffEditor: null,
+  aiLogs: [],
+  pendingEdits: [],
+  activeAgentRun: null,
+  verificationResult: null,
+  workspaceIndexStatus: null,
+  lastSnapshotId: null,
+  lastAgentPrompt: '',
+  lastAgentModel: ''
 };
 
 const els = {
@@ -88,6 +97,19 @@ const els = {
   terminalCommand: document.querySelector('#terminalCommand'),
   terminalStop: document.querySelector('#terminalStop'),
   outputLog: document.querySelector('#outputLog'),
+  aiLogList: document.querySelector('#aiLogList'),
+  aiLogSummary: document.querySelector('#aiLogSummary'),
+  clearAiLogs: document.querySelector('#clearAiLogs'),
+  pendingEditsPanel: document.querySelector('#pendingEditsPanel'),
+  pendingEditsSummary: document.querySelector('#pendingEditsSummary'),
+  pendingEditsList: document.querySelector('#pendingEditsList'),
+  applyAllPendingEdits: document.querySelector('#applyAllPendingEdits'),
+  rejectAllPendingEdits: document.querySelector('#rejectAllPendingEdits'),
+  rollbackLastSnapshot: document.querySelector('#rollbackLastSnapshot'),
+  verificationSummary: document.querySelector('#verificationSummary'),
+  verificationOutput: document.querySelector('#verificationOutput'),
+  runVerification: document.querySelector('#runVerification'),
+  runBrowserVerification: document.querySelector('#runBrowserVerification'),
   problems: document.querySelector('#problems'),
   modelNameInput: document.querySelector('#modelNameInput'),
   pullModel: document.querySelector('#pullModel'),
@@ -108,6 +130,15 @@ const els = {
   palette: document.querySelector('#palette'),
   paletteInput: document.querySelector('#paletteInput'),
   paletteResults: document.querySelector('#paletteResults'),
+  
+  openClawSettingsBtn: document.querySelector('#openClawSettingsBtn'),
+  openClawConfig: document.querySelector('#openClawConfig'),
+  openClawUrl: document.querySelector('#openClawUrl'),
+  openClawMessages: document.querySelector('#openClawMessages'),
+  openClawInput: document.querySelector('#openClawInput'),
+  sendOpenClaw: document.querySelector('#sendOpenClaw'),
+  clearOpenClaw: document.querySelector('#clearOpenClaw'),
+  openClawModelSelect: document.querySelector('#openClawModelSelect'),
   contextMenu: document.querySelector('#contextMenu'),
   sendPrompt: document.querySelector('#sendPrompt'),
   planWorkBtn: document.querySelector('#planWorkBtn'),
@@ -168,7 +199,8 @@ const icons = {
   terminal: '<svg viewBox="0 0 24 24"><path d="m4 7 5 5-5 5"/><path d="M12 17h8"/></svg>',
   plus: '<svg viewBox="0 0 24 24"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
   square: '<svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12"/></svg>',
-  close: '<svg viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>'
+  close: '<svg viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>',
+  bot: '<svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg>'
 };
 
 function iconSvg(name) {
@@ -407,6 +439,7 @@ async function openWorkspace() {
   await restoreWorkspaceChat();
   resetActiveTerminalToWorkspaceRoot();
   refreshGit();
+  refreshIndexStatus();
   setStatus(`Opened ${workspace.name}`);
 }
 
@@ -417,6 +450,7 @@ async function refreshWorkspace() {
   renderTree(workspace.tree);
   updateSelectedEntry();
   resetActiveTerminalToWorkspaceRoot();
+  refreshIndexStatus();
 }
 
 async function openFileDialog() {
@@ -1709,10 +1743,11 @@ function buildInitialEditPlan(instruction, files = []) {
   ].slice(0, 6);
   const targetLabel = targetFiles.length ? targetFiles.join(', ') : 'the relevant project files';
   return [
-    `Understand the requested change: ${instruction}`,
-    `Inspect likely target files: ${targetLabel}`,
-    'Apply the code changes to the affected file or files',
-    'Verify the result and report the changed files'
+    `Understand the requested change and constraints: ${instruction}`,
+    'Inspect the workspace structure and identify the likely ownership path',
+    `Search and read the smallest relevant context: ${targetLabel}`,
+    'Apply a focused edit to the affected file or files',
+    'Run the best available local verification command and report the result'
   ];
 }
 
@@ -1906,7 +1941,7 @@ function directChatResponse(instruction, route) {
   if (/\b(what\s+can\s+you\s+do|how\s+can\s+you\s+help|what\s+do\s+you\s+do)\b/.test(text)) {
     return [
       'I can help with coding inside this IDE: explain files, summarize projects, plan changes, edit files, run terminal commands, and manage local Ollama models.',
-      'For simple safe edits I can act directly. For larger tasks I break the work into steps and use the agent loop.'
+      'For project edits I inspect the workspace, search and read relevant files, make focused changes, then run the best local verification command I can find.'
     ].join('\n\n');
   }
 
@@ -1929,8 +1964,154 @@ function parseJsonObject(text) {
 
 function workspacePathFromRelative(relative) {
   if (!state.workspace?.root || !relative) return null;
-  const clean = relative.replace(/^[/\\]+/, '');
+  const clean = String(relative).replace(/^[/\\]+/, '').replace(/\\/g, '/');
+  if (!clean || clean.split('/').includes('..')) return null;
   return `${state.workspace.root}/${clean}`;
+}
+
+async function inferVerificationCommand() {
+  if (!state.workspace?.root) return '';
+  const packagePath = workspacePathFromRelative('package.json');
+  if (!packagePath) return '';
+  try {
+    const result = await window.anton.readFile(packagePath);
+    const parsed = JSON.parse(result.content || '{}');
+    const scripts = parsed.scripts && typeof parsed.scripts === 'object' ? parsed.scripts : {};
+    const ordered = [
+      ['test', 'npm test'],
+      ['check', 'npm run check'],
+      ['typecheck', 'npm run typecheck'],
+      ['lint', 'npm run lint'],
+      ['build', 'npm run build']
+    ];
+    const found = ordered.find(([name]) => typeof scripts[name] === 'string' && scripts[name].trim());
+    return found ? found[1] : '';
+  } catch {
+    return '';
+  }
+}
+
+function formatVerificationResult(command, result) {
+  if (!command || !result) return 'Verification: no package script was available to run automatically.';
+  const output = `${result.stdout || ''}\n${result.stderr || ''}`
+    .trim()
+    .split('\n')
+    .slice(-24)
+    .join('\n');
+  const hasWarnings = /\bwarning\b|\[warning\]|syntax-error|unterminated string|expected identifier/i.test(output);
+  return [
+    `Verification command: \`${command}\``,
+    `Exit code: ${result.code}`,
+    hasWarnings ? 'Warnings: detected. Review the output before treating this edit as clean.' : 'Warnings: none detected.',
+    output ? `Output:\n\`\`\`\n${output}\n\`\`\`` : 'Output: (none)'
+  ].join('\n');
+}
+
+function renderVerificationResult(result) {
+  state.verificationResult = result;
+  if (!els.verificationSummary || !els.verificationOutput) return;
+
+  if (!result) {
+    els.verificationSummary.textContent = 'No verification run yet.';
+    els.verificationOutput.textContent = '';
+    return;
+  }
+
+  if (result.browser) {
+    const browser = result.browser;
+    els.verificationSummary.textContent = browser.ok
+      ? `Browser check passed: ${browser.url || 'local app'}`
+      : `Browser check failed: ${browser.error || browser.url || 'local app'}`;
+    els.verificationOutput.textContent = JSON.stringify(browser, null, 2);
+    activatePanel('verification');
+    return;
+  }
+
+  const commands = Array.isArray(result.results)
+    ? result.results
+    : Array.isArray(result.commands)
+      ? result.commands
+      : [];
+  if (!commands.length) {
+    els.verificationSummary.textContent = 'No verification scripts were detected.';
+    els.verificationOutput.textContent = JSON.stringify(result, null, 2);
+    activatePanel('verification');
+    return;
+  }
+
+  const failed = result.ok === false || commands.some((item) => item.code !== 0 || item.seriousWarning || item.seriousWarnings);
+  els.verificationSummary.textContent = failed
+    ? `Verification needs attention: ${commands.length} check${commands.length === 1 ? '' : 's'} ran`
+    : `Verification passed: ${commands.length} check${commands.length === 1 ? '' : 's'} ran`;
+  els.verificationOutput.textContent = commands.map((item) => {
+    const output = `${item.stdout || ''}\n${item.stderr || ''}`.trim();
+    return [
+      `$ ${item.command}`,
+      `exit: ${item.code}`,
+      (item.seriousWarning || item.seriousWarnings) ? 'serious warning: yes' : 'serious warning: no',
+      output || '(no output)'
+    ].join('\n');
+  }).join('\n\n');
+  activatePanel('verification');
+}
+
+async function runVerificationAndRender() {
+  const result = await window.anton.runVerification();
+  renderVerificationResult(result);
+  return result;
+}
+
+async function refreshIndexStatus() {
+  if (!window.anton.indexStatus) return null;
+  try {
+    const status = await window.anton.indexStatus();
+    state.workspaceIndexStatus = status;
+    if (status?.status === 'ready' && typeof status.fileCount === 'number') {
+      setStatus(`Index ready: ${status.fileCount} files`);
+    }
+    return status;
+  } catch {
+    return null;
+  }
+}
+
+async function reviewProposedEdit({ path, content }) {
+  try {
+    validateGeneratedSource(path, content);
+    if (!state.lastAgentModel || !state.lastAgentPrompt) {
+      return { approved: true, reason: 'Local validators passed.' };
+    }
+
+    const prompt = [
+      'You are Anton reviewing a proposed source edit before it is shown to the user.',
+      'Return ONLY valid JSON with this shape: {"decision":"approve"|"revise"|"needs more context","reason":"short reason"}.',
+      'Approve only if the proposed file content directly satisfies the user request, preserves unrelated behavior, and contains no wrapper artifacts.',
+      '',
+      '<user_request>',
+      state.lastAgentPrompt,
+      '</user_request>',
+      '',
+      `<proposed_file path="${path}">`,
+      content.slice(0, 24000),
+      '</proposed_file>'
+    ].join('\n');
+    const raw = await generateWithFallback({
+      model: state.lastAgentModel,
+      prompt,
+      stream: false,
+      requestId: state.currentRequestId,
+      format: 'json',
+      timeoutMs: 0
+    });
+    const parsed = parseJsonObject(raw);
+    const decision = String(parsed.decision || '').toLowerCase();
+    return {
+      approved: decision === 'approve',
+      reason: parsed.reason || `Self-review returned ${decision || 'no decision'}.`
+    };
+  } catch (error) {
+    return { approved: false, reason: error.message };
+  }
 }
 
 async function validateWorkspaceEdit(filePath, nextContent) {
@@ -1949,6 +2130,80 @@ async function validateWorkspaceEdit(filePath, nextContent) {
   const lostManyLines = nextContent.split('\n').length < current.split('\n').length * 0.65;
   if (removedTooMuch || lostManyLines) {
     throw new Error(`Refusing destructive edit to ${relativeWorkspacePath(filePath)}. The model removed too much existing content. Ask for a more specific edit or open the target file first.`);
+  }
+}
+
+function inspectCssSyntax(content) {
+  const errors = [];
+  if (/"editedCode"\s*:/.test(content) || /```/.test(content)) {
+    errors.push('CSS contains a model-response artifact such as "editedCode" or a Markdown code fence.');
+  }
+
+  let depth = 0;
+  let quote = '';
+  let line = 1;
+  let blockComment = false;
+  for (let i = 0; i < content.length; i += 1) {
+    const char = content[i];
+    const next = content[i + 1];
+    if (char === '\n') line += 1;
+
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        blockComment = false;
+        i += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (char === '\\') {
+        i += 1;
+        continue;
+      }
+      if (char === quote) quote = '';
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      blockComment = true;
+      i += 1;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === '{') depth += 1;
+    if (char === '}') {
+      depth -= 1;
+      if (depth < 0) {
+        errors.push(`CSS has an extra closing brace near line ${line}.`);
+        depth = 0;
+      }
+    }
+  }
+  if (quote) errors.push('CSS has an unterminated string.');
+  if (blockComment) errors.push('CSS has an unterminated block comment.');
+  if (depth > 0) errors.push('CSS has an unclosed rule block.');
+
+  return errors;
+}
+
+function validateGeneratedSource(relativePath, content) {
+  const pathText = String(relativePath || '');
+  const errors = [];
+  if (/"editedCode"\s*:/.test(content) || /```/.test(content)) {
+    errors.push('Source contains a model-response artifact such as "editedCode" or a Markdown code fence.');
+  }
+  if (/\.(json|jsonc)$/i.test(pathText)) {
+    try {
+      JSON.parse(content);
+    } catch (error) {
+      errors.push(`Invalid JSON: ${error.message}`);
+    }
+  }
+  if (/\.css$/i.test(pathText)) errors.push(...inspectCssSyntax(content));
+  if (errors.length) {
+    throw new Error(`Refusing to save invalid source in ${relativePath}: ${errors.join(' ')}`);
   }
 }
 
@@ -2018,27 +2273,152 @@ async function applyWorkspaceEdits(editPlan) {
     }
 
     await validateWorkspaceEdit(filePath, nextContent);
-    const result = await window.anton.saveFile({ filePath, content: nextContent });
-    changed.push(result.filePath);
+    const pending = await createPendingEdit({ path: editPath, content: nextContent, source: 'edit-plan' });
+    changed.push(pending.path);
+  }
 
-    const tab = state.tabs.find((candidate) => candidate.filePath === result.filePath);
-    if (tab) {
-      tab.model.setValue(result.content);
-      tab.dirty = false;
-      tab.modifiedAt = result.modifiedAt;
-      tab.name = result.name;
+  return changed;
+}
+
+function renderPendingEdits() {
+  if (!els.pendingEditsPanel || !els.pendingEditsList) return;
+  const count = state.pendingEdits.length;
+  els.pendingEditsPanel.classList.toggle('hidden', count === 0 && !state.lastSnapshotId);
+  els.pendingEditsSummary.textContent = count
+    ? `${count} pending edit${count === 1 ? '' : 's'} awaiting review`
+    : state.lastSnapshotId
+      ? 'No pending edits. Rollback is available.'
+      : 'No pending edits';
+  els.applyAllPendingEdits.disabled = count === 0;
+  els.rejectAllPendingEdits.disabled = count === 0;
+  els.rollbackLastSnapshot.disabled = !state.lastSnapshotId;
+  els.pendingEditsList.innerHTML = '';
+  for (const edit of state.pendingEdits) {
+    const row = document.createElement('div');
+    row.className = 'pending-edit-row';
+    row.innerHTML = `
+      <button class="pending-edit-path" title="${escapeHtml(edit.path)}">${escapeHtml(edit.path)}</button>
+      <button class="mini-button preview">Preview</button>
+      <button class="mini-button apply">Apply</button>
+      <button class="mini-button reject">Reject</button>
+    `;
+    row.querySelector('.pending-edit-path').addEventListener('click', () => previewPendingEdit(edit.id));
+    row.querySelector('.preview').addEventListener('click', () => previewPendingEdit(edit.id));
+    row.querySelector('.apply').addEventListener('click', () => applyPendingEdit(edit.id));
+    row.querySelector('.reject').addEventListener('click', () => rejectPendingEdit(edit.id));
+    els.pendingEditsList.appendChild(row);
+  }
+}
+
+function previewPendingEdit(id) {
+  const edit = state.pendingEdits.find((item) => item.id === id);
+  if (!edit) return;
+  const key = `pending-edit:${edit.id}`;
+  const existing = state.models.get(key);
+  if (existing) {
+    activateTab(existing);
+    return;
+  }
+  const language = languageFromPath(edit.path);
+  const originalModel = monaco.editor.createModel(edit.original || '', language, monaco.Uri.parse(`anton-pending-original:///${encodeURIComponent(key)}`));
+  const modifiedModel = monaco.editor.createModel(edit.content || '', language, monaco.Uri.parse(`anton-pending-modified:///${encodeURIComponent(key)}`));
+  const tab = {
+    type: 'diff',
+    name: `${fileName(edit.path)} (Pending)`,
+    filePath: null,
+    diffPath: edit.path,
+    repoRoot: state.workspace?.root || '',
+    diffKey: key,
+    staged: false,
+    originalModel,
+    modifiedModel,
+    dirty: false,
+    pendingEditId: edit.id
+  };
+  state.tabs.push(tab);
+  state.models.set(key, tab);
+  activateTab(tab);
+}
+
+function closePendingDiffTab(id) {
+  const key = `pending-edit:${id}`;
+  const tab = state.models.get(key);
+  if (tab) closeTab(tab);
+}
+
+async function createPendingEdit({ path, content, source = 'agent', prompt = state.lastAgentPrompt, model = state.lastAgentModel }) {
+  validateGeneratedSource(path, content);
+  const pending = await window.anton.createPendingEdit({ path, content, source, prompt, model });
+  state.pendingEdits.push(pending);
+  renderPendingEdits();
+  previewPendingEdit(pending.id);
+  return pending;
+}
+
+async function refreshAfterFileMutation(result = {}) {
+  if (result.workspace) {
+    state.workspace = result.workspace;
+    renderTree(state.workspace.tree);
+    updateSelectedEntry();
+  } else {
+    const workspace = await window.anton.refreshWorkspace();
+    if (workspace) {
+      state.workspace = workspace;
+      renderTree(workspace.tree);
+      updateSelectedEntry();
     }
   }
-
-  const workspace = await window.anton.refreshWorkspace();
-  if (workspace) {
-    state.workspace = workspace;
-    renderTree(workspace.tree);
-    updateSelectedEntry();
+  if (result.file?.filePath) {
+    const tab = state.tabs.find((candidate) => candidate.filePath === result.file.filePath);
+    if (tab) {
+      tab.model.setValue(result.file.content);
+      tab.dirty = false;
+      tab.modifiedAt = result.file.modifiedAt;
+      tab.name = result.file.name;
+    } else {
+      await openFilePath(result.file.filePath);
+    }
   }
   renderTabs();
-  if (changed[0]) await openFilePath(changed[0]);
-  return changed.map(relativeWorkspacePath);
+  queueGitRefresh();
+}
+
+async function applyPendingEdit(id) {
+  const result = await window.anton.applyPendingEdit({ id, prompt: state.lastAgentPrompt, model: state.lastAgentModel });
+  state.pendingEdits = state.pendingEdits.filter((edit) => edit.id !== id);
+  state.lastSnapshotId = result.snapshot?.id || state.lastSnapshotId;
+  closePendingDiffTab(id);
+  await refreshAfterFileMutation(result);
+  renderPendingEdits();
+  setStatus(`Applied ${result.applied}`);
+  return result;
+}
+
+async function rejectPendingEdit(id) {
+  await window.anton.rejectPendingEdit({ id });
+  state.pendingEdits = state.pendingEdits.filter((edit) => edit.id !== id);
+  closePendingDiffTab(id);
+  renderPendingEdits();
+  setStatus('Pending edit rejected.');
+}
+
+async function applyAllPendingEdits() {
+  const ids = state.pendingEdits.map((edit) => edit.id);
+  for (const id of ids) await applyPendingEdit(id);
+}
+
+async function rejectAllPendingEdits() {
+  const ids = state.pendingEdits.map((edit) => edit.id);
+  for (const id of ids) await rejectPendingEdit(id);
+}
+
+async function rollbackLastSnapshot() {
+  if (!state.lastSnapshotId) return;
+  const result = await window.anton.restoreSnapshot({ snapshotId: state.lastSnapshotId });
+  state.lastSnapshotId = null;
+  await refreshAfterFileMutation(result);
+  renderPendingEdits();
+  setStatus(`Rolled back ${result.restored?.length || 0} file(s).`);
 }
 
 function extractRequestedCssColor(instruction) {
@@ -2078,6 +2458,13 @@ function nearestColorAfterKeyword(instruction, keywordPattern) {
   return '';
 }
 
+function isExplicitDocumentTitleInstruction(instruction) {
+  const text = String(instruction || '').toLowerCase();
+  if (/\b(color|background|style|css|font|foreground|heading|headings|h1|h2|h3)\b/.test(text)) return false;
+  return /\b(browser tab title|document title|html title|page title|metadata title|meta title)\b/.test(text) ||
+    /<title\b/i.test(instruction);
+}
+
 function requestedCssColorChanges(instruction) {
   const text = instruction.toLowerCase();
   const tokens = extractCssColorTokens(instruction);
@@ -2086,23 +2473,30 @@ function requestedCssColorChanges(instruction) {
   const changes = [];
   const backgroundColor = nearestColorAfterKeyword(instruction, /\bbackground(?:-color)?\b/gi);
   const textColor = nearestColorAfterKeyword(instruction, /\b(?:text|font|foreground)\b/gi);
+  const titleColor = nearestColorAfterKeyword(instruction, /\b(?:title|titles|heading|headings|h1|h2|h3)\b/gi);
 
-  if (backgroundColor) changes.push({ property: 'background', value: backgroundColor });
-  if (textColor) changes.push({ property: 'color', value: textColor });
+  if (backgroundColor) changes.push({ scope: 'page', property: 'background', value: backgroundColor });
+  if (textColor) changes.push({ scope: 'page', property: 'color', value: textColor });
+  if (titleColor) changes.push({ scope: 'titles', property: 'color', value: titleColor });
 
   if (!changes.length) {
-    const property = /\b(text|font|foreground)\b/.test(text) && !/\bbackground\b/.test(text) ? 'color' : 'background';
-    changes.push({ property, value: tokens[0].value });
+    const titleOnly = /\b(title|titles|heading|headings|h1|h2|h3)\b/.test(text) && !/\bbackground|text|font|foreground\b/.test(text);
+    const property = /\b(text|font|foreground|color)\b/.test(text) && !/\bbackground\b/.test(text) ? 'color' : 'background';
+    changes.push({
+      scope: titleOnly ? 'titles' : 'page',
+      property: titleOnly ? 'color' : property,
+      value: tokens[0].value
+    });
   }
 
   return changes.filter((change, index, all) =>
-    all.findIndex((candidate) => candidate.property === change.property) === index
+    all.findIndex((candidate) => candidate.scope === change.scope && candidate.property === change.property) === index
   );
 }
 
 function isSimpleCssColorRequest(instruction) {
   const text = instruction.toLowerCase();
-  const asksColor = /\b(background|background-color|text|font|color|theme)\b/.test(text);
+  const asksColor = /\b(background|background-color|text|font|color|theme|title|titles|heading|headings|h1|h2|h3)\b/.test(text);
   const asksChange = /\b(make|change|set|turn|give|update)\b/.test(text);
   const hasColor = Boolean(extractRequestedCssColor(instruction));
   const avoidsComplexWork = !/\b(layout|spacing|responsive|animation|component|button|navbar|sidebar|rewrite|build|implement|fix)\b/.test(text);
@@ -2159,7 +2553,7 @@ function applySimpleCssColorChange(content, instruction) {
   const changes = requestedCssColorChanges(instruction);
   if (!changes.length) return null;
 
-  const selectors = [
+  const pageSelectors = [
     /(?:^|\n)\s*:root\s*\{[\s\S]*?\}/i,
     /(?:^|\n)\s*(?:html\s*,\s*)?body(?:\s*,\s*#root)?\s*\{[\s\S]*?\}/i,
     /(?:^|\n)\s*#root\s*\{[\s\S]*?\}/i,
@@ -2167,11 +2561,19 @@ function applySimpleCssColorChange(content, instruction) {
     /(?:^|\n)\s*\.app\s*\{[\s\S]*?\}/i,
     /(?:^|\n)\s*\.App\s*\{[\s\S]*?\}/
   ];
+  const titleSelectors = [
+    /(?:^|\n)\s*h1\s*,\s*h2\s*,\s*h3\s*\{[\s\S]*?\}/i,
+    /(?:^|\n)\s*:is\(h1,\s*h2,\s*h3\)\s*\{[\s\S]*?\}/i,
+    /(?:^|\n)\s*(?:h1|h2|h3)\s*\{[\s\S]*?\}/i,
+    /(?:^|\n)\s*\.title\s*\{[\s\S]*?\}/i,
+    /(?:^|\n)\s*\.heading\s*\{[\s\S]*?\}/i
+  ];
 
   let next = content;
   let applied = false;
   for (const change of changes) {
     let changedThisProperty = false;
+    const selectors = change.scope === 'titles' ? titleSelectors : pageSelectors;
     for (const selector of selectors) {
       const changed = upsertCssPropertyInRule(next, selector, change.property, change.value);
       if (changed && changed !== next) {
@@ -2181,14 +2583,24 @@ function applySimpleCssColorChange(content, instruction) {
       }
     }
     if (!changedThisProperty) {
-      next = `html,\nbody,\n#root {\n  ${change.property}: ${change.value};\n}\n\n${next}`;
+      const selector = change.scope === 'titles' ? 'h1,\nh2,\nh3,\n.title,\n.heading' : 'html,\nbody,\n#root';
+      next = `${selector} {\n  ${change.property}: ${change.value};\n}\n\n${next}`;
       applied = true;
     }
   }
 
   if (applied) return next;
-  const declarations = changes.map((change) => `  ${change.property}: ${change.value};`).join('\n');
-  return `html,\nbody,\n#root {\n${declarations}\n}\n\n${content}`;
+  const pageDeclarations = changes
+    .filter((change) => change.scope === 'page')
+    .map((change) => `  ${change.property}: ${change.value};`);
+  const titleDeclarations = changes
+    .filter((change) => change.scope === 'titles')
+    .map((change) => `  ${change.property}: ${change.value};`);
+  return [
+    pageDeclarations.length ? `html,\nbody,\n#root {\n${pageDeclarations.join('\n')}\n}` : '',
+    titleDeclarations.length ? `h1,\nh2,\nh3,\n.title,\n.heading {\n${titleDeclarations.join('\n')}\n}` : '',
+    content
+  ].filter(Boolean).join('\n\n');
 }
 
 async function tryQuickCssColorEdit(instruction, progress) {
@@ -2197,53 +2609,42 @@ async function tryQuickCssColorEdit(instruction, progress) {
   if (!target) return null;
 
   progress.setTaskPlan(
-    [`Patch ${target}`, 'Refresh workspace', 'Open changed stylesheet'],
+    [`Patch ${target}`, 'Create pending diff', 'Review before apply'],
     0,
-    `Applying quick CSS edit to ${target}`,
+    `Preparing quick CSS edit for ${target}`,
     {
       file: target,
       section: 'Simple CSS color change',
-      action: 'Applying direct stylesheet patch'
+      action: 'Preparing pending stylesheet patch'
     }
   );
 
   const filePath = workspacePathFromRelative(target);
   const current = (await window.anton.readFile(filePath)).content || '';
+  if (inspectCssSyntax(current).length) return null;
   const next = applySimpleCssColorChange(current, instruction);
   if (!next || next === current) return null;
+  validateGeneratedSource(target, next);
 
-  const result = await window.anton.saveFile({ filePath, content: next });
-  const tab = state.tabs.find((candidate) => candidate.filePath === result.filePath);
-  if (tab) {
-    tab.model.setValue(result.content);
-    tab.dirty = false;
-    tab.modifiedAt = result.modifiedAt;
-    tab.name = result.name;
-  }
+  const pending = await createPendingEdit({ path: target, content: next, source: 'quick-css', prompt: instruction });
 
   progress.setTaskPlan(
-    [`Patch ${target}`, 'Refresh workspace', 'Open changed stylesheet'],
+    [`Patch ${target}`, 'Create pending diff', 'Review before apply'],
     1,
-    `Saved ${target}`,
+    `Created pending diff for ${target}`,
     {
       file: target,
-      section: 'Saved stylesheet',
-      action: 'Refreshing workspace'
+      section: 'Pending stylesheet edit',
+      action: 'Waiting for user review'
     }
   );
 
-  const workspace = await window.anton.refreshWorkspace();
-  if (workspace) {
-    state.workspace = workspace;
-    renderTree(workspace.tree);
-    updateSelectedEntry();
-  }
-  renderTabs();
-  await openFilePath(result.filePath);
-  progress.completeTaskPlan('Quick CSS edit finished.');
+  progress.completeTaskPlan('Quick CSS edit is ready for review.');
   return {
     changedFiles: [target],
-    summary: `Applied the simple CSS color change directly in ${target}.`
+    pendingEditId: pending.id,
+    summary: `Created a pending CSS color change in ${target}.`,
+    verificationSummary: 'Verification: deferred until pending edits are applied.'
   };
 }
 
@@ -2285,7 +2686,7 @@ function detectExactReplaceTask(instruction) {
 
 function detectHtmlTitleTask(instruction) {
   const text = instruction.trim();
-  if (!/\b(title|browser tab|document title)\b/i.test(text)) return null;
+  if (!isExplicitDocumentTitleInstruction(text)) return null;
   if (!/\b(change|set|update|make)\b/i.test(text)) return null;
   const title = parseQuotedValue(text) || text.match(/\b(?:to|as)\s+(.+?)\s*$/i)?.[1]?.trim();
   if (!title || title.length > 120) return null;
@@ -2337,32 +2738,15 @@ function detectQuickTask(instruction) {
 async function saveQuickTaskFile(relative, content) {
   const filePath = workspacePathFromRelative(relative);
   if (!filePath) throw new Error(`Invalid path ${relative}`);
+  validateGeneratedSource(relative, content);
   await validateWorkspaceEdit(filePath, content);
-  const result = await window.anton.saveFile({ filePath, content });
-  const tab = state.tabs.find((candidate) => candidate.filePath === result.filePath);
-  if (tab) {
-    tab.model.setValue(result.content);
-    tab.dirty = false;
-    tab.modifiedAt = result.modifiedAt;
-    tab.name = result.name;
-  }
-  return result;
+  return createPendingEdit({ path: relative, content, source: 'quick-task' });
 }
 
 async function finishQuickTask(progress, result, statusText = 'Quick task finished.') {
   const changed = Array.isArray(result.changedFiles) ? result.changedFiles : [];
+  result.verificationSummary = 'Verification: deferred until pending edits are applied.';
   progress.completeTaskPlan(statusText);
-  const workspace = await window.anton.refreshWorkspace();
-  if (workspace) {
-    state.workspace = workspace;
-    renderTree(workspace.tree);
-    updateSelectedEntry();
-  }
-  renderTabs();
-  if (changed[0]) {
-    const filePath = workspacePathFromRelative(changed[0]);
-    if (filePath) await openFilePath(filePath);
-  }
   return result;
 }
 
@@ -2459,7 +2843,7 @@ function shouldIncludeInAiContext(filePath) {
   const relative = relativeWorkspacePath(filePath);
   if (/package-lock\.json$/.test(relative)) return false;
   if (/(^|\/)(node_modules|dist|build|\.git)\//.test(relative)) return false;
-  return /\.(js|jsx|ts|tsx|json|css|html|md|yml|yaml|toml|env|txt)$/i.test(relative);
+  return /\.(js|jsx|ts|tsx|json|css|html|md|yml|yaml|toml|env|txt|vue)$/i.test(relative);
 }
 
 function shouldUseProjectContext(mode, instruction) {
@@ -2826,12 +3210,128 @@ function cleanIpcErrorMessage(error) {
     .trim();
 }
 
-async function generateWithFallback({ model, prompt, stream, requestId, format, timeoutMs }) {
+function defaultOllamaOptions() {
+  return {
+    temperature: 0.15,
+    num_ctx: 32768
+  };
+}
+
+function createAiLog({ model, prompt, stream, requestId, format, timeoutMs, options }) {
+  const requestOptions = {
+    ...defaultOllamaOptions(),
+    ...(options || {})
+  };
+  const entry = {
+    id: `ai-log-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    startedAt: Date.now(),
+    status: 'running',
+    payload: {
+      endpoint: '/api/generate',
+      body: {
+        model,
+        prompt,
+        stream: stream ?? true,
+        options: requestOptions,
+        ...(format ? { format } : {})
+      },
+      requestId,
+      timeoutMs
+    },
+    response: '',
+    error: ''
+  };
+  state.aiLogs.unshift(entry);
+  state.aiLogs = state.aiLogs.slice(0, 80);
+  renderAiLogs();
+  return entry;
+}
+
+function finishAiLog(entry, patch) {
+  if (!entry) return;
+  Object.assign(entry, patch);
+  entry.endedAt = Date.now();
+  entry.durationMs = entry.endedAt - entry.startedAt;
+  renderAiLogs();
+}
+
+function renderAiLogs() {
+  if (!els.aiLogList) return;
+  const count = state.aiLogs.length;
+  if (els.aiLogSummary) {
+    els.aiLogSummary.textContent = count
+      ? `${count} model request${count === 1 ? '' : 's'} captured`
+      : 'No AI requests yet.';
+  }
+  if (!count) {
+    els.aiLogList.innerHTML = '<div class="empty">No AI requests have been sent yet.</div>';
+    return;
+  }
+  els.aiLogList.innerHTML = state.aiLogs.map((entry) => {
+    const body = entry.payload?.body || {};
+    const metaPayload = {
+      endpoint: entry.payload?.endpoint,
+      requestId: entry.payload?.requestId,
+      model: body.model,
+      stream: body.stream,
+      format: body.format,
+      options: body.options,
+      timeoutMs: entry.payload?.timeoutMs,
+      promptChars: body.prompt?.length || 0
+    };
+    const duration = entry.durationMs != null
+      ? formatDuration(entry.durationMs)
+      : formatDuration(Date.now() - entry.startedAt);
+    const response = entry.response || (entry.status === 'running' ? '(waiting for response...)' : '');
+    return `
+      <article class="ai-log-entry ${entry.status}">
+        <div class="ai-log-head">
+          <div>
+            <div class="ai-log-title">${escapeHtml(body.model || 'Unknown model')}</div>
+            <div class="ai-log-meta">${escapeHtml(entry.status)} · ${escapeHtml(duration)} · ${escapeHtml(new Date(entry.startedAt).toLocaleTimeString())}</div>
+          </div>
+          <span class="ai-log-badge">${escapeHtml(body.format || 'text')}</span>
+        </div>
+        <div class="ai-log-details">
+          <details>
+            <summary>Payload metadata</summary>
+            <pre>${escapeHtml(JSON.stringify(metaPayload, null, 2))}</pre>
+          </details>
+          <details>
+            <summary>Prompt sent to model</summary>
+            <pre>${escapeHtml(body.prompt || '')}</pre>
+          </details>
+          <details ${entry.status !== 'running' && response ? 'open' : ''}>
+            <summary>Model response</summary>
+            <pre>${escapeHtml(response)}</pre>
+          </details>
+          ${entry.error ? `
+            <details open>
+              <summary>Error</summary>
+              <pre>${escapeHtml(entry.error)}</pre>
+            </details>
+          ` : ''}
+        </div>
+      </article>
+    `;
+  }).join('');
+}
+
+async function generateWithFallback({ model, prompt, stream, requestId, format, timeoutMs, options }) {
   if (!model) throw new Error('No local model is selected.');
+  const requestOptions = {
+    ...defaultOllamaOptions(),
+    ...(options || {})
+  };
+  const logEntry = createAiLog({ model, prompt, stream, requestId, format, timeoutMs, options: requestOptions });
   try {
-    return await window.anton.generate({ model, prompt, stream, requestId, format, timeoutMs });
+    const response = await window.anton.generate({ model, prompt, stream, requestId, format, timeoutMs, options: requestOptions });
+    finishAiLog(logEntry, { status: 'success', response: String(response || '') });
+    return response;
   } catch (error) {
-    throw new Error(`Selected model ${model} failed: ${cleanIpcErrorMessage(error)}`);
+    const message = cleanIpcErrorMessage(error);
+    finishAiLog(logEntry, { status: 'error', error: message });
+    throw new Error(`Selected model ${model} failed: ${message}`);
   }
 }
 
@@ -3008,15 +3508,41 @@ async function classifyUserIntent({ model, instruction, mode, requestId }) {
 }
 
 const agentTools = {
+  searchIndex: async (args) => {
+    const { query, limit } = args;
+    if (!query) return "Error: 'query' argument is required.";
+    try {
+      const matches = await window.anton.searchIndex({ query, limit });
+      return JSON.stringify({ query, matches }, null, 2);
+    } catch (err) {
+      return `Error searching index: ${err.message}`;
+    }
+  },
+
   runCommand: async (args) => {
-    const { command } = args;
+    const { command, approved = false } = args;
     if (!command) return "Error: 'command' argument is required.";
     try {
+      const policy = await window.anton.classifyCommand({ command });
+      if (policy.classification === 'blocked') return `Blocked command: ${policy.reason}`;
+      if (policy.classification === 'needs_approval' && !approved) {
+        return `Command requires approval before Anton can run it: ${policy.reason}. If the user approves, call requestCommandApproval first.`;
+      }
       const result = await window.anton.executeCommand({ command });
       return `Exit Code: ${result.code}\nSTDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`;
     } catch (err) {
       return `Error executing command: ${err.message}`;
     }
+  },
+
+  requestCommandApproval: async (args) => {
+    const { command } = args;
+    if (!command) return "Error: 'command' argument is required.";
+    const policy = await window.anton.classifyCommand({ command });
+    if (policy.classification === 'blocked') return `Blocked command: ${policy.reason}`;
+    const approved = confirm(`Anton wants to run this command:\n\n${command}\n\nReason: ${policy.reason}\n\nAllow it?`);
+    if (!approved) return 'Command approval denied by user.';
+    return await agentTools.runCommand({ command, approved: true });
   },
 
   readFile: async (args) => {
@@ -3098,6 +3624,20 @@ const agentTools = {
     }
   },
 
+  searchWorkspace: async (args) => {
+    const { query } = args;
+    if (!query) return "Error: 'query' argument is required.";
+    try {
+      const result = await window.anton.searchWorkspace(query);
+      return JSON.stringify({
+        query,
+        matches: result
+      }, null, 2);
+    } catch (err) {
+      return `Error searching workspace: ${err.message}`;
+    }
+  },
+
   outlineFile: async (args) => {
     const { path: relativePath } = args;
     if (!relativePath) return "Error: 'path' argument is required.";
@@ -3122,12 +3662,18 @@ const agentTools = {
     const filePath = workspacePathFromRelative(relativePath);
     if (!filePath) return `Error: Invalid path ${relativePath}`;
     try {
-      await window.anton.saveFile({ filePath, content });
-      return `Successfully wrote file to ${relativePath}`;
+      validateGeneratedSource(relativePath, content);
+      await validateWorkspaceEdit(filePath, content);
+      const review = await reviewProposedEdit({ path: relativePath, content });
+      if (!review.approved) return `Error: proposed edit did not pass self-review. ${review.reason}`;
+      const pending = await createPendingEdit({ path: relativePath, content, source: 'agent-write' });
+      return `Created pending edit ${pending.id} for ${relativePath}. User must review and apply the diff before files change.`;
     } catch (err) {
-      return `Error writing file: ${err.message}`;
+      return `Error creating pending file edit: ${err.message}`;
     }
   },
+
+  proposeFileEdit: async (args) => agentTools.writeFile(args),
 
   replaceRange: async (args) => {
     const { path: relativePath, startLine, endLine, content } = args;
@@ -3136,12 +3682,26 @@ const agentTools = {
     const filePath = workspacePathFromRelative(relativePath);
     if (!filePath) return `Error: Invalid path ${relativePath}`;
     try {
-      const result = await window.anton.replaceRange({ filePath, startLine, endLine, content });
-      return `Successfully replaced ${relativePath}:${result.changedRange.startLine}-${result.changedRange.endLine}`;
+      const current = (await window.anton.readFile(filePath)).content || '';
+      const lines = current.split('\n');
+      const start = Math.max(1, Number(startLine) || 1);
+      const end = Math.min(lines.length, Math.max(start, Number(endLine) || start));
+      const nextLines = content.split(/\r?\n/);
+      if (nextLines[nextLines.length - 1] === '') nextLines.pop();
+      lines.splice(start - 1, end - start + 1, ...nextLines);
+      const nextContent = lines.join('\n');
+      validateGeneratedSource(relativePath, nextContent);
+      await validateWorkspaceEdit(filePath, nextContent);
+      const review = await reviewProposedEdit({ path: relativePath, content: nextContent });
+      if (!review.approved) return `Error: proposed range edit did not pass self-review. ${review.reason}`;
+      const pending = await createPendingEdit({ path: relativePath, content: nextContent, source: 'agent-range' });
+      return `Created pending range edit ${pending.id} for ${relativePath}:${start}-${end}. User must review and apply the diff before files change.`;
     } catch (err) {
-      return `Error replacing range: ${err.message}`;
+      return `Error creating pending range edit: ${err.message}`;
     }
   },
+
+  proposeRangeEdit: async (args) => agentTools.replaceRange(args),
 
   insertAtLine: async (args) => {
     const { path: relativePath, line, content } = args;
@@ -3150,10 +3710,21 @@ const agentTools = {
     const filePath = workspacePathFromRelative(relativePath);
     if (!filePath) return `Error: Invalid path ${relativePath}`;
     try {
-      const result = await window.anton.insertAtLine({ filePath, line, content });
-      return `Successfully inserted into ${relativePath}:${result.changedRange.startLine}-${result.changedRange.endLine}`;
+      const current = (await window.anton.readFile(filePath)).content || '';
+      const lines = current.split('\n');
+      const insertAt = Math.max(1, Math.min(Number(line) || lines.length + 1, lines.length + 1));
+      const nextLines = content.split(/\r?\n/);
+      if (nextLines[nextLines.length - 1] === '') nextLines.pop();
+      lines.splice(insertAt - 1, 0, ...nextLines);
+      const nextContent = lines.join('\n');
+      validateGeneratedSource(relativePath, nextContent);
+      await validateWorkspaceEdit(filePath, nextContent);
+      const review = await reviewProposedEdit({ path: relativePath, content: nextContent });
+      if (!review.approved) return `Error: proposed insert did not pass self-review. ${review.reason}`;
+      const pending = await createPendingEdit({ path: relativePath, content: nextContent, source: 'agent-insert' });
+      return `Created pending insert edit ${pending.id} for ${relativePath}:${insertAt}. User must review and apply the diff before files change.`;
     } catch (err) {
-      return `Error inserting at line: ${err.message}`;
+      return `Error creating pending insert edit: ${err.message}`;
     }
   },
 
@@ -3163,10 +3734,39 @@ const agentTools = {
     const filePath = workspacePathFromRelative(relativePath);
     if (!filePath) return `Error: Invalid path ${relativePath}`;
     try {
-      const result = await window.anton.deleteRange({ filePath, startLine, endLine });
-      return `Successfully deleted ${relativePath}:${startLine}-${endLine}. Next content starts around line ${result.changedRange.startLine}`;
+      const current = (await window.anton.readFile(filePath)).content || '';
+      const lines = current.split('\n');
+      const start = Math.max(1, Number(startLine) || 1);
+      const end = Math.min(lines.length, Math.max(start, Number(endLine) || start));
+      lines.splice(start - 1, end - start + 1);
+      const nextContent = lines.join('\n');
+      validateGeneratedSource(relativePath, nextContent);
+      await validateWorkspaceEdit(filePath, nextContent);
+      const review = await reviewProposedEdit({ path: relativePath, content: nextContent });
+      if (!review.approved) return `Error: proposed deletion did not pass self-review. ${review.reason}`;
+      const pending = await createPendingEdit({ path: relativePath, content: nextContent, source: 'agent-delete' });
+      return `Created pending deletion edit ${pending.id} for ${relativePath}:${start}-${end}. User must review and apply the diff before files change.`;
     } catch (err) {
-      return `Error deleting range: ${err.message}`;
+      return `Error creating pending deletion edit: ${err.message}`;
+    }
+  },
+
+  runVerification: async () => {
+    try {
+      const result = await runVerificationAndRender();
+      return JSON.stringify(result, null, 2);
+    } catch (err) {
+      return `Error running verification: ${err.message}`;
+    }
+  },
+
+  verifyBrowser: async (args = {}) => {
+    try {
+      const result = await window.anton.verifyBrowser(args);
+      renderVerificationResult({ browser: result });
+      return JSON.stringify(result, null, 2);
+    } catch (err) {
+      return `Error running browser verification: ${err.message}`;
     }
   }
 };
@@ -3203,7 +3803,7 @@ function buildAgentLoopPrompt({ instruction, history, projectContext, fileCache,
     '  "currentStepIndex": 0,',
     '  "explanation": "brief description of current action",',
     '  "action": {',
-    '    "tool": "runCommand" | "fileStats" | "outlineFile" | "searchFile" | "readFileRange" | "replaceRange" | "insertAtLine" | "deleteRange" | "readFile" | "writeFile" | "done",',
+    '    "tool": "searchIndex" | "searchWorkspace" | "runCommand" | "requestCommandApproval" | "fileStats" | "outlineFile" | "searchFile" | "readFileRange" | "proposeRangeEdit" | "replaceRange" | "insertAtLine" | "deleteRange" | "readFile" | "proposeFileEdit" | "writeFile" | "runVerification" | "verifyBrowser" | "done",',
     '    "arguments": {',
       '      "command": "optional shell command to run",',
       '      "path": "optional relative file path",',
@@ -3216,16 +3816,20 @@ function buildAgentLoopPrompt({ instruction, history, projectContext, fileCache,
     '  }',
     '}',
     'CRITICAL RULES:',
-    '1. Break down the user instruction into a specific checklist (the "plan") that names the real files, UI areas, commands, or behavior you will inspect or change. Each plan item must be a plain human-readable string, not a JSON object and not a tool call.',
-    '2. Execute one tool call at a time. The loop will continue and feed you the results.',
-    '3. NEVER use readFile for a file already listed under <files_already_read>. The content is right there — use it.',
-    '4. For edit, build, fix, create, delete, style, or layout requests, at least one relevant writeFile action must succeed before you call tool "done". Reading files is not enough.',
-    '5. Do not output markdown, notes, or explanations outside the JSON object.',
-    '6. After writing a file, move on — do not re-read it unless you need to verify a specific value.',
-    '7. Read only files needed for the current task. Do not inspect every project file unless the user explicitly asks for a full-project audit.',
-    '8. If the target file is obvious from the request or workspace context, read that file first, then write the corrected full file content.',
-    '9. Large files must use this flow: fileStats, then outlineFile or searchFile, then readFileRange, then replaceRange/insertAtLine/deleteRange, then readFileRange again to verify.',
-    '10. Never use readFile or writeFile on a file reported as large. Patch the exact line range instead so the selected small model only sees relevant context.',
+    '1. Follow this problem-solving loop: understand the request, inspect the workspace shape, searchIndex for ownership before broad searchWorkspace, read targeted files, propose the smallest coherent edit, then verify after edits are applied.',
+    '2. Break down the user instruction into a specific checklist that names real files, UI areas, commands, or behavior you will inspect or change. Each plan item must be a plain human-readable string.',
+    '3. Execute one tool call at a time. The loop will continue and feed you the results.',
+    '4. Start with searchIndex, searchWorkspace, fileStats, outlineFile, readFileRange, or readFile unless the request is explicitly to create a new file. Do not write before enough context has been inspected.',
+    '5. NEVER use readFile for a file already listed under <files_already_read>. The content is right there — use it.',
+    '6. For edit, build, fix, create, delete, style, or layout requests, at least one relevant proposeFileEdit/writeFile or range edit action must create a pending edit before you call tool "done". Reading files is not enough.',
+    '7. Do not output markdown, notes, or explanations outside the JSON object.',
+    '8. Read only files needed for the current task. Do not inspect every project file unless the user explicitly asks for a full-project audit.',
+    '9. If the target file is obvious from the request or workspace context, inspect that file first, then write the corrected full file content or a precise range patch.',
+    '10. Large files must use this flow: fileStats, then outlineFile or searchFile, then readFileRange, then proposeRangeEdit/replaceRange/insertAtLine/deleteRange, then readFileRange again to verify.',
+    '11. Never use readFile or writeFile on a file reported as large. Patch the exact line range instead so the selected local model only sees relevant context.',
+    '12. If the user asks for title, titles, heading, or heading color/style, treat that as visible UI text such as h1/h2/h3/.title/.heading. Do not edit the HTML <title> tag unless the user explicitly says browser tab title, document title, HTML title, or metadata title.',
+    '13. writeFile, replaceRange, insertAtLine, and deleteRange create pending edits for user review. Disk files do not change until the user applies the diff.',
+    '14. Use runVerification for local checks. Use verifyBrowser for web UI/style prompts after edits are applied or when checking the current app.',
     '',
     '<user_request>',
     instruction,
@@ -3311,6 +3915,8 @@ async function askAnton(mode = 'custom') {
   state.lastAiResponse = '';
   const requestId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
   state.currentRequestId = requestId;
+  state.lastAgentPrompt = instructionWithMentions;
+  state.lastAgentModel = model;
   setAiBusy(true);
 
   const progress = createRunProgress(responseNode, [
@@ -3341,12 +3947,14 @@ async function askAnton(mode = 'custom') {
         const finalSummary = [
           quickTask.summary,
           '',
-          'Changed files:',
-          ...quickTask.changedFiles.map((file) => `- ${file}`)
+          'Pending edits:',
+          ...quickTask.changedFiles.map((file) => `- ${file}`),
+          '',
+          quickTask.verificationSummary || 'Verification: no package script was available to run automatically.'
         ].join('\n');
         setMessageMarkdown(responseNode, finalSummary, { durationMs });
         persistMessage('assistant', finalSummary, { durationMs });
-        setStatus('Quick task finished.');
+        setStatus('Pending edit awaiting review.');
         playNotificationSound();
         return;
       }
@@ -3357,8 +3965,9 @@ async function askAnton(mode = 'custom') {
       const commandCache = {};
       const changedFiles = new Set();
       let successfulWrites = 0;
+      const pendingEditStartCount = state.pendingEdits.length;
       let stepCount = 0;
-      let maxSteps = 10;
+      let maxSteps = state.settings.agentMode ? 10 : 6;
       let agentState = {
         plan: buildInitialEditPlan(effectiveInstruction, editableFiles),
         currentStepIndex: 0,
@@ -3412,7 +4021,7 @@ async function askAnton(mode = 'custom') {
           });
 
           if (userChoice === 'continue') {
-            maxSteps += 5;
+            maxSteps += state.settings.agentMode ? 5 : 2;
             setAiBusy(true);
           } else {
             break;
@@ -3505,16 +4114,23 @@ async function askAnton(mode = 'custom') {
 
         // Guard: if tool is missing or not recognized, inject corrective feedback and retry
         const validTools = new Set([
+          'searchIndex',
           'runCommand',
+          'requestCommandApproval',
           'fileStats',
           'outlineFile',
+          'searchWorkspace',
           'searchFile',
           'readFileRange',
+          'proposeRangeEdit',
           'replaceRange',
           'insertAtLine',
           'deleteRange',
           'readFile',
+          'proposeFileEdit',
           'writeFile',
+          'runVerification',
+          'verifyBrowser',
           'done'
         ]);
         if (!tool || !validTools.has(tool)) {
@@ -3558,7 +4174,7 @@ async function askAnton(mode = 'custom') {
 
         progress.setTaskPlan(agentState.plan, agentState.currentStepIndex, toolDesc, toolLocation);
 
-        const writeTools = new Set(['writeFile', 'replaceRange', 'insertAtLine', 'deleteRange']);
+        const writeTools = new Set(['writeFile', 'proposeFileEdit', 'replaceRange', 'proposeRangeEdit', 'insertAtLine', 'deleteRange']);
 
         if (tool === 'done' && successfulWrites === 0) {
           history.push({
@@ -3570,7 +4186,7 @@ async function askAnton(mode = 'custom') {
             content: [
               'The user requested an edit task, but no file has been changed yet.',
               'Do not call done after only reading or planning.',
-              'Choose the relevant writeFile or range edit action now. If the file is large, use replaceRange, insertAtLine, or deleteRange instead of writeFile.'
+              'Choose the relevant proposeFileEdit/writeFile or range edit action now. If the file is large, use proposeRangeEdit, replaceRange, insertAtLine, or deleteRange instead of writeFile.'
             ].join(' ')
           });
           progress.setTaskPlan(agentState.plan, agentState.currentStepIndex, 'Waiting for Anton to write the actual file change', {
@@ -3586,7 +4202,11 @@ async function askAnton(mode = 'custom') {
         }
 
         let observation = '';
-        if (tool === 'runCommand') {
+        if (tool === 'searchIndex') {
+          observation = await agentTools.searchIndex(args);
+        } else if (tool === 'requestCommandApproval') {
+          observation = await agentTools.requestCommandApproval(args);
+        } else if (tool === 'runCommand') {
           if (commandCache[args.command]) {
             observation = [
               `The command "${args.command}" was already run. Use the cached result below and choose a different next action instead of running it again.`,
@@ -3601,6 +4221,8 @@ async function askAnton(mode = 'custom') {
           observation = await agentTools.fileStats(args);
         } else if (tool === 'outlineFile') {
           observation = await agentTools.outlineFile(args);
+        } else if (tool === 'searchWorkspace') {
+          observation = await agentTools.searchWorkspace(args);
         } else if (tool === 'searchFile') {
           observation = await agentTools.searchFile(args);
         } else if (tool === 'readFileRange') {
@@ -3619,7 +4241,7 @@ async function askAnton(mode = 'custom') {
               fileCache[args.path] = observation;
             }
           }
-        } else if (tool === 'writeFile') {
+        } else if (tool === 'writeFile' || tool === 'proposeFileEdit') {
           observation = await agentTools.writeFile(args);
           if (observation && !observation.startsWith('Error')) {
             successfulWrites += 1;
@@ -3627,19 +4249,23 @@ async function askAnton(mode = 'custom') {
           }
           // Invalidate cache after a write so re-reads get fresh content
           if (fileCache[args.path]) delete fileCache[args.path];
-        } else if (tool === 'replaceRange') {
+        } else if (tool === 'replaceRange' || tool === 'proposeRangeEdit') {
           observation = await agentTools.replaceRange(args);
         } else if (tool === 'insertAtLine') {
           observation = await agentTools.insertAtLine(args);
         } else if (tool === 'deleteRange') {
           observation = await agentTools.deleteRange(args);
+        } else if (tool === 'runVerification') {
+          observation = await agentTools.runVerification(args);
+        } else if (tool === 'verifyBrowser') {
+          observation = await agentTools.verifyBrowser(args);
         }
 
         if (writeTools.has(tool) && observation && !observation.startsWith('Error')) {
-          if (tool !== 'writeFile') successfulWrites += 1;
+          if (!['writeFile', 'proposeFileEdit'].includes(tool)) successfulWrites += 1;
           if (args.path) {
             changedFiles.add(
-              ['replaceRange', 'deleteRange'].includes(tool)
+              ['replaceRange', 'proposeRangeEdit', 'deleteRange'].includes(tool)
                 ? `${args.path}:${args.startLine || '?'}-${args.endLine || '?'}`
                 : tool === 'insertAtLine'
                   ? `${args.path}:${args.line || '?'}`
@@ -3669,19 +4295,52 @@ async function askAnton(mode = 'custom') {
         throw new Error('No files were changed. Anton only inspected the project, so the webpage could not update.');
       }
 
-      progress.completeTaskPlan('Task finished successfully.');
+      const newPendingEditCount = Math.max(0, state.pendingEdits.length - pendingEditStartCount);
+      let verificationSummary = newPendingEditCount
+        ? 'Verification: deferred until pending edits are applied.'
+        : 'Verification: no package script was available to run automatically.';
+      if (!newPendingEditCount) {
+        progress.setTaskPlan(
+          agentState.plan,
+          Math.max(0, agentState.plan.length - 1),
+          'Running verification checks',
+          {
+            file: 'package.json',
+            section: 'Local verification',
+            action: 'Running detected verification checks'
+          }
+        );
+        const verificationResult = await runVerificationAndRender();
+        const commands = Array.isArray(verificationResult.results)
+          ? verificationResult.results
+          : Array.isArray(verificationResult.commands)
+            ? verificationResult.commands
+            : [];
+        verificationSummary = commands.length
+          ? `Verification: ${verificationResult.ok ? 'passed' : 'needs attention'} (${commands.length} check${commands.length === 1 ? '' : 's'}).`
+          : 'Verification: no package script was available to run automatically.';
+      }
+
+      progress.completeTaskPlan(newPendingEditCount ? 'Pending edits are ready for review.' : 'Task finished successfully.');
       const durationMs = progress.finish();
       responseNode.className = 'message assistant';
       const changedList = Array.from(changedFiles);
       const finalSummary = [
-        renderAgentStatus(agentState.plan, agentState.plan.length, 'Completed all plan steps.', 'Task finished successfully.'),
+        renderAgentStatus(
+          agentState.plan,
+          agentState.plan.length,
+          'Completed all plan steps.',
+          newPendingEditCount ? 'Pending edits are ready for review.' : 'Task finished successfully.'
+        ),
         changedList.length
-          ? `\nChanged files:\n${changedList.map((file) => `- ${file}`).join('\n')}`
-          : ''
+          ? `\nPending edits:\n${changedList.map((file) => `- ${file}`).join('\n')}`
+          : '',
+        '',
+        verificationSummary
       ].join('');
       setMessageMarkdown(responseNode, finalSummary, { durationMs });
       persistMessage('assistant', finalSummary, { durationMs });
-      setStatus('Task finished successfully.');
+      setStatus(newPendingEditCount ? 'Pending edits awaiting review.' : 'Task finished successfully.');
       playNotificationSound();
 
       const workspace = await window.anton.refreshWorkspace();
@@ -3739,7 +4398,7 @@ async function askAnton(mode = 'custom') {
     'Do not wrap your answer in JSON unless the user explicitly asks for JSON.',
     'If no editor file is open, use the workspace context below instead of saying the file is empty.',
     needsProjectContext
-      ? 'The user is asking about the loaded workspace. You must answer from the workspace context, naming the project type, main files, and likely behavior. Do not give a generic greeting.'
+      ? 'Answer the user request directly based on the workspace context provided below.'
       : 'If the user is only greeting you, a brief greeting is fine.',
     'Never output placeholder expressions such as obj["current_file_content"]; answer naturally from the provided information.',
     '',
@@ -3927,6 +4586,12 @@ function setSetting(key, value) {
   document.querySelector('#minimapToggle').checked = state.settings.minimap;
   document.querySelector('#wordWrapToggle').checked = state.settings.wordWrap;
   document.querySelector('#keepAwakeToggle').checked = state.settings.keepAwake;
+  
+  const agentToggle = document.querySelector('#agentModeToggle');
+  if (agentToggle) agentToggle.checked = state.settings.agentMode;
+  const promptAgentToggle = document.querySelector('#promptAgentModeToggle');
+  if (promptAgentToggle) promptAgentToggle.checked = state.settings.agentMode;
+
   document.querySelector('#fontSizeInput').value = state.settings.fontSize;
 
   if (key === 'keepAwake') {
@@ -4227,6 +4892,9 @@ function bindEditorEvents() {
 }
 
 function bindUi() {
+  document.querySelector('#agentModeToggle').checked = state.settings.agentMode;
+  document.querySelector('#promptAgentModeToggle').checked = state.settings.agentMode;
+
   document.querySelectorAll('.activity').forEach((node) => node.addEventListener('click', () => activateView(node.dataset.view)));
   document.querySelectorAll('.panel-tab').forEach((node) => node.addEventListener('click', () => activatePanel(node.dataset.panel)));
 
@@ -4269,6 +4937,125 @@ function bindUi() {
   document.querySelector('#refreshModels').addEventListener('click', loadModels);
   els.pullModel.addEventListener('click', pullModel);
   els.refreshCatalog.addEventListener('click', loadModelCatalog);
+  els.clearAiLogs?.addEventListener('click', () => {
+    state.aiLogs = [];
+    renderAiLogs();
+  });
+  els.applyAllPendingEdits?.addEventListener('click', () => applyAllPendingEdits().catch((error) => setStatus(error.message)));
+  els.rejectAllPendingEdits?.addEventListener('click', () => rejectAllPendingEdits().catch((error) => setStatus(error.message)));
+  els.rollbackLastSnapshot?.addEventListener('click', () => rollbackLastSnapshot().catch((error) => setStatus(error.message)));
+  els.runVerification?.addEventListener('click', () => {
+    runVerificationAndRender()
+      .then((result) => setStatus(result.ok ? 'Verification passed.' : 'Verification needs attention.'))
+      .catch((error) => {
+        renderVerificationResult({ commands: [], ok: false, error: error.message });
+        setStatus(error.message);
+      });
+  });
+  els.runBrowserVerification?.addEventListener('click', () => {
+    window.anton.verifyBrowser({})
+      .then((result) => {
+        renderVerificationResult({ browser: result });
+        setStatus(result.ok ? 'Browser verification passed.' : 'Browser verification failed.');
+      })
+      .catch((error) => {
+        renderVerificationResult({ browser: { ok: false, error: error.message } });
+        setStatus(error.message);
+      });
+  });
+
+  // OpenClaw bindings
+  els.openClawSettingsBtn?.addEventListener('click', () => {
+    els.openClawConfig.classList.toggle('hidden');
+  });
+
+  if (els.openClawUrl) {
+    els.openClawUrl.value = state.settings.openClawEndpoint || 'http://127.0.0.1:18789/v1/chat/completions';
+    els.openClawUrl.addEventListener('change', () => {
+      setSetting('openClawEndpoint', els.openClawUrl.value);
+    });
+  }
+
+  async function loadOpenClawModels() {
+    if (!els.openClawModelSelect) return;
+    try {
+      const { primary, models } = await window.anton.getOpenClawModelInfo();
+      els.openClawModelSelect.innerHTML = '';
+      if (!models || models.length === 0) {
+        els.openClawModelSelect.innerHTML = '<option value="">No models configured</option>';
+        return;
+      }
+      for (const model of models) {
+        const opt = document.createElement('option');
+        opt.value = model;
+        opt.textContent = model;
+        if (model === primary) opt.selected = true;
+        els.openClawModelSelect.appendChild(opt);
+      }
+    } catch (e) {
+      console.error('Error loading OpenClaw models:', e);
+      els.openClawModelSelect.innerHTML = '<option value="">Error loading models</option>';
+    }
+  }
+
+  els.openClawModelSelect?.addEventListener('change', async () => {
+    const selected = els.openClawModelSelect.value;
+    if (!selected) return;
+    try {
+      const success = await window.anton.setOpenClawModel(selected);
+      if (success) {
+        setStatus(`OpenClaw model switched to: ${selected}`);
+      } else {
+        setStatus('Failed to switch OpenClaw model');
+      }
+    } catch (e) {
+      setStatus(`Error switching model: ${e.message}`);
+    }
+  });
+
+  loadOpenClawModels();
+
+  els.clearOpenClaw?.addEventListener('click', () => {
+    els.openClawMessages.innerHTML = '<div class="openclaw-message system">Chat cleared.</div>';
+    state.openClawHistory = [];
+  });
+
+  els.sendOpenClaw?.addEventListener('click', async () => {
+    const text = els.openClawInput.value.trim();
+    if (!text) return;
+    els.openClawInput.value = '';
+    
+    const msgEl = document.createElement('div');
+    msgEl.className = 'openclaw-message user';
+    msgEl.textContent = text;
+    els.openClawMessages.appendChild(msgEl);
+    els.openClawMessages.scrollTop = els.openClawMessages.scrollHeight;
+
+    if (!state.openClawHistory) state.openClawHistory = [];
+    state.openClawHistory.push({ role: 'user', content: text });
+
+    const endpoint = state.settings.openClawEndpoint || els.openClawUrl.value;
+    
+    const astEl = document.createElement('div');
+    astEl.className = 'openclaw-message assistant';
+    astEl.textContent = 'Thinking...';
+    els.openClawMessages.appendChild(astEl);
+    els.openClawMessages.scrollTop = els.openClawMessages.scrollHeight;
+
+    try {
+      const data = await window.anton.sendOpenClawMessage({
+        endpoint,
+        model: els.openClawModelSelect?.value || '',
+        messages: state.openClawHistory
+      });
+      const reply = data.choices?.[0]?.message?.content || JSON.stringify(data);
+      astEl.textContent = reply;
+      state.openClawHistory.push({ role: 'assistant', content: reply });
+    } catch (e) {
+      astEl.textContent = `Error: ${e.message}`;
+    }
+  });
+
   document.querySelector('#sendPrompt').addEventListener('click', () => {
     if (state.aiBusy) {
       stopAiGeneration();
@@ -4354,6 +5141,8 @@ function bindUi() {
   document.querySelector('#minimapToggle').addEventListener('change', (event) => setSetting('minimap', event.target.checked));
   document.querySelector('#wordWrapToggle').addEventListener('change', (event) => setSetting('wordWrap', event.target.checked));
   document.querySelector('#keepAwakeToggle').addEventListener('change', (event) => setSetting('keepAwake', event.target.checked));
+  document.querySelector('#agentModeToggle').addEventListener('change', (event) => setSetting('agentMode', event.target.checked));
+  document.querySelector('#promptAgentModeToggle').addEventListener('change', (event) => setSetting('agentMode', event.target.checked));
   // Use 'input' so font size changes apply immediately as the user types
   document.querySelector('#fontSizeInput').addEventListener('input', (event) => {
     const val = Number(event.target.value);
@@ -4411,6 +5200,11 @@ function bindUi() {
   });
   window.anton.onOllamaToken((payload) => {
     if (window.__antonTokenHandler) window.__antonTokenHandler(payload);
+    const entry = state.aiLogs.find((e) => e.payload?.requestId === payload.requestId);
+    if (entry) {
+      entry.response = (entry.response || '') + (payload.token || '');
+      renderAiLogs();
+    }
   });
   window.anton.onOllamaPullProgress((payload) => {
     updateActiveDownloadProgress(payload);

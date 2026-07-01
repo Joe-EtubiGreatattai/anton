@@ -14,6 +14,7 @@
         <button id="scmActivity" class="activity" data-view="scm" data-icon="branch" title="Source Control"></button>
         <button class="activity" data-view="run" data-icon="play" title="Run and Debug"></button>
         <button class="activity" data-view="extensions" data-icon="blocks" title="Extensions"></button>
+        <button class="activity" data-view="openclaw" data-icon="bot" title="OpenClaw"></button>
         <button class="activity bottom" data-view="settings" data-icon="settings" title="Settings"></button>
       </aside>
 
@@ -124,12 +125,40 @@
           </div>
         </section>
 
+        <section class="side-view" id="view-openclaw">
+          <div class="section-head">
+            <span>OpenClaw Chat</span>
+            <div class="icon-row">
+              <button id="clearOpenClaw" data-icon="trash" title="Clear Chat"></button>
+              <button id="openClawSettingsBtn" data-icon="settings" title="Endpoint Settings"></button>
+            </div>
+          </div>
+          <div class="openclaw-model-bar">
+            <span>Model:</span>
+            <select id="openClawModelSelect" class="select-input">
+              <option value="">Loading...</option>
+            </select>
+          </div>
+          <div id="openClawConfig" class="openclaw-config hidden">
+            <label>API Endpoint:</label>
+            <input type="text" id="openClawUrl" class="text-input" placeholder="http://127.0.0.1:18789/v1/chat/completions">
+          </div>
+          <div id="openClawMessages" class="openclaw-messages">
+            <div class="openclaw-message system">Welcome to OpenClaw. Configure your endpoint in settings to begin.</div>
+          </div>
+          <div class="openclaw-input-container">
+            <textarea id="openClawInput" class="text-input" placeholder="Message OpenClaw..."></textarea>
+            <button id="sendOpenClaw" class="primary-button">Send</button>
+          </div>
+        </section>
+
         <section class="side-view" id="view-settings">
           <div class="section-head"><span>Settings</span></div>
           <label class="setting-row"><input id="autosaveToggle" type="checkbox" checked /> Autosave</label>
           <label class="setting-row"><input id="minimapToggle" type="checkbox" checked /> Minimap</label>
           <label class="setting-row"><input id="wordWrapToggle" type="checkbox" /> Word wrap</label>
           <label class="setting-row"><input id="keepAwakeToggle" type="checkbox" /> Prevent sleep</label>
+          <label class="setting-row"><input id="agentModeToggle" type="checkbox" /> Agent mode</label>
           <label class="field-label">Font size <input id="fontSizeInput" type="number" min="11" max="24" value="14" /></label>
           <div class="settings-divider"></div>
           <div class="section-head compact"><span>Models</span></div>
@@ -194,7 +223,21 @@
             <div id="messages" class="messages">
               <div class="message system">Local Ollama assistant. It can use the active file and workspace file names as context.</div>
             </div>
+            <div id="pendingEditsPanel" class="pending-edits hidden">
+              <div class="pending-edits-head">
+                <span id="pendingEditsSummary">No pending edits</span>
+                <div>
+                  <button id="applyAllPendingEdits" class="mini-button">Apply All</button>
+                  <button id="rejectAllPendingEdits" class="mini-button">Reject All</button>
+                  <button id="rollbackLastSnapshot" class="mini-button">Rollback</button>
+                </div>
+              </div>
+              <div id="pendingEditsList" class="pending-edits-list"></div>
+            </div>
             <div class="prompt-box">
+              <div class="prompt-mode-row">
+                <label><input id="promptAgentModeToggle" type="checkbox" /> Agent Mode</label>
+              </div>
               <div id="mentionMenu" class="mention-menu hidden"></div>
               <textarea id="prompt" spellcheck="true" placeholder="Ask Anton about this code..."></textarea>
               <button id="sendPrompt" class="primary-button">Send</button>
@@ -209,6 +252,8 @@
             <button class="panel-tab active" data-panel="terminal">Terminal</button>
             <button class="panel-tab" data-panel="problems">Problems</button>
             <button class="panel-tab" data-panel="output">Output</button>
+            <button class="panel-tab" data-panel="verification">Verification</button>
+            <button class="panel-tab" data-panel="ai-logs">AI logs</button>
           </div>
           <div class="panel-body active" id="panel-terminal">
             <div class="terminal-tabs">
@@ -227,6 +272,21 @@
           </div>
           <div class="panel-body" id="panel-output">
             <pre id="outputLog">Anton started.</pre>
+          </div>
+          <div class="panel-body" id="panel-verification">
+            <div class="verification-toolbar">
+              <span id="verificationSummary">No verification run yet.</span>
+              <button id="runVerification" class="mini-button">Run Checks</button>
+              <button id="runBrowserVerification" class="mini-button">Browser Check</button>
+            </div>
+            <pre id="verificationOutput"></pre>
+          </div>
+          <div class="panel-body" id="panel-ai-logs">
+            <div class="ai-log-toolbar">
+              <span id="aiLogSummary">No AI requests yet.</span>
+              <button id="clearAiLogs" class="icon-button" data-icon="trash" title="Clear AI logs"></button>
+            </div>
+            <div id="aiLogList" class="ai-log-list"></div>
           </div>
         </section>
 

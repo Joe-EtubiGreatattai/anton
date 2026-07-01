@@ -34,6 +34,9 @@ let workspaceRoot = null;
 let watcher = null;
 const terminalSessions = new Map();
 const activeOllamaControllers = new Map();
+const pendingEdits = new Map();
+const workspaceIndexState = new Map();
+let browserVerificationServer = null;
 let powerBlockerId = null;
 let ollamaStartAttempt = null;
 
@@ -147,6 +150,24 @@ async function ensureOllamaReady() {
   throw new Error(`Ollama is offline. Anton tried to start it but could not reach ${OLLAMA_URL}. Open Ollama or run "ollama serve", then retry.`);
 }
 
+async function listLocalOllamaModelNames({ startIfNeeded = false } = {}) {
+  try {
+    if (startIfNeeded) {
+      await ensureOllamaReady();
+    } else if (!(await isOllamaReachable())) {
+      return [];
+    }
+    const response = await fetchWithTimeout(`${OLLAMA_URL}/api/tags`, {}, 3500);
+    if (!response.ok) return [];
+    const data = await response.json();
+    return (data.models || [])
+      .map((model) => model.name)
+      .filter((name) => typeof name === 'string' && name.trim());
+  } catch {
+    return [];
+  }
+}
+
 function createWindow() {
   const { width: workAreaWidth, height: workAreaHeight } = screen.getPrimaryDisplay().workAreaSize;
   mainWindow = new BrowserWindow({
@@ -237,6 +258,10 @@ function watchWorkspace(root) {
 
 async function openWorkspace(folderPath) {
   const previousDefault = workspaceRoot || app.getPath('home');
+  if (browserVerificationServer?.process && !browserVerificationServer.process.killed && folderPath !== workspaceRoot) {
+    browserVerificationServer.process.kill();
+    browserVerificationServer = null;
+  }
   workspaceRoot = folderPath;
   for (const session of terminalSessions.values()) {
     if (!session.process && (!session.cwd || session.cwd === previousDefault || session.cwd === app.getPath('home'))) {
@@ -246,6 +271,15 @@ async function openWorkspace(folderPath) {
     }
   }
   watchWorkspace(folderPath);
+  rebuildWorkspaceIndex().catch((error) => {
+    workspaceIndexState.set(workspaceRoot, {
+      status: 'error',
+      fileCount: 0,
+      updatedAt: new Date().toISOString(),
+      error: error.message,
+      dbPath: indexDbPath()
+    });
+  });
   return {
     root: folderPath,
     name: path.basename(folderPath),
@@ -500,6 +534,333 @@ async function readWorkspaceText(relativeFilePath, repoRoot = workspaceRoot) {
     return await fs.readFile(resolveWorkspacePath(relativeFilePath, repoRoot), 'utf8');
   } catch {
     return '';
+  }
+}
+
+function workspaceRelativePath(filePath) {
+  if (!workspaceRoot || !filePath) return filePath;
+  return path.relative(workspaceRoot, filePath).replace(/\\/g, '/');
+}
+
+function safeWorkspaceFilePath(relativeFilePath) {
+  if (!workspaceRoot) throw new Error('Open a workspace first.');
+  const normalized = String(relativeFilePath || '').replace(/^[/\\]+/, '').replace(/\\/g, '/');
+  if (!normalized || normalized.includes('\0') || normalized.split('/').includes('..')) {
+    throw new Error('Invalid workspace path.');
+  }
+  const absolutePath = path.resolve(workspaceRoot, normalized);
+  const root = path.resolve(workspaceRoot);
+  if (absolutePath !== root && !absolutePath.startsWith(`${root}${path.sep}`)) {
+    throw new Error('Path is outside the workspace.');
+  }
+  return absolutePath;
+}
+
+function indexDbPath(root = workspaceRoot) {
+  if (!root) return null;
+  const id = crypto.createHash('sha256').update(root).digest('hex');
+  return path.join(app.getPath('userData'), 'workspace-indexes', `${id}.sqlite`);
+}
+
+function snapshotsDir(root = workspaceRoot) {
+  const id = crypto.createHash('sha256').update(root || 'no-workspace').digest('hex');
+  return path.join(app.getPath('userData'), 'snapshots', id);
+}
+
+function isIndexableRelativePath(relativePath) {
+  const normalized = String(relativePath || '').replace(/\\/g, '/');
+  if (!normalized || normalized.includes('\0')) return false;
+  if (/(^|\/)(\.git|node_modules|dist|build|\.next|coverage|\.venv|venv)\//.test(normalized)) return false;
+  if (/(^|\/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/.test(normalized)) return false;
+  return /\.(js|jsx|ts|tsx|css|scss|html|json|md|yml|yaml|toml|env|txt|vue|svelte|py|go|rs|java|c|cpp|h|hpp)$/i.test(normalized);
+}
+
+async function listIndexableFiles(root = workspaceRoot, dir = root, acc = []) {
+  if (!root || !dir) return acc;
+  let entries = [];
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return acc;
+  }
+  for (const entry of entries) {
+    if (isIgnored(entry.name)) continue;
+    const fullPath = path.join(dir, entry.name);
+    const relative = path.relative(root, fullPath).replace(/\\/g, '/');
+    if (entry.isDirectory()) {
+      if (/(^|\/)(node_modules|dist|build|\.next|coverage|\.git)\b/.test(relative)) continue;
+      await listIndexableFiles(root, fullPath, acc);
+      continue;
+    }
+    if (!isIndexableRelativePath(relative)) continue;
+    try {
+      const stats = await fileStats(fullPath);
+      if (stats.binary || stats.size > MAX_FILE_BYTES || stats.lineCount > 4000) continue;
+      acc.push({ fullPath, relative, stats });
+    } catch {
+      // Skip unreadable files.
+    }
+  }
+  return acc;
+}
+
+function runSqlite(dbPath, sql) {
+  return new Promise((resolve) => {
+    const child = spawn('sqlite3', [dbPath], { env: commandEnv(), shell: false });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('error', (error) => resolve({ code: 1, stdout, stderr: error.message }));
+    child.on('close', (code) => resolve({ code, stdout, stderr }));
+    child.stdin.end(sql);
+  });
+}
+
+function sqlString(value) {
+  return `'${String(value ?? '').replace(/'/g, "''")}'`;
+}
+
+async function rebuildWorkspaceIndex() {
+  if (!workspaceRoot) throw new Error('Open a workspace before indexing.');
+  const dbPath = indexDbPath();
+  await fs.mkdir(path.dirname(dbPath), { recursive: true });
+  const files = await listIndexableFiles(workspaceRoot);
+  const startedAt = Date.now();
+  workspaceIndexState.set(workspaceRoot, { status: 'indexing', fileCount: 0, updatedAt: new Date().toISOString(), dbPath });
+  const statements = [
+    'PRAGMA journal_mode=WAL;',
+    'DROP TABLE IF EXISTS files;',
+    'DROP TABLE IF EXISTS file_index;',
+    'CREATE TABLE files(path TEXT PRIMARY KEY, size INTEGER, line_count INTEGER, updated_at TEXT);',
+    "CREATE VIRTUAL TABLE file_index USING fts5(path, content, tokenize='porter unicode61');",
+    'BEGIN;'
+  ];
+  for (const file of files) {
+    let content = '';
+    try {
+      content = await fs.readFile(file.fullPath, 'utf8');
+    } catch {
+      continue;
+    }
+    statements.push(`INSERT OR REPLACE INTO files(path,size,line_count,updated_at) VALUES(${sqlString(file.relative)},${Number(file.stats.size) || 0},${Number(file.stats.lineCount) || 0},${sqlString(new Date().toISOString())});`);
+    statements.push(`INSERT INTO file_index(path,content) VALUES(${sqlString(file.relative)},${sqlString(content.slice(0, 200000))});`);
+  }
+  statements.push('COMMIT;');
+  const result = await runSqlite(dbPath, statements.join('\n'));
+  if (result.code !== 0) {
+    workspaceIndexState.set(workspaceRoot, { status: 'error', fileCount: 0, updatedAt: new Date().toISOString(), error: result.stderr || result.stdout, dbPath });
+    throw new Error(result.stderr || 'Could not build SQLite index.');
+  }
+  const state = {
+    status: 'ready',
+    fileCount: files.length,
+    updatedAt: new Date().toISOString(),
+    durationMs: Date.now() - startedAt,
+    dbPath
+  };
+  workspaceIndexState.set(workspaceRoot, state);
+  return state;
+}
+
+async function searchWorkspaceIndex(query, limit = 30) {
+  if (!workspaceRoot || !query?.trim()) return [];
+  const dbPath = indexDbPath();
+  if (!(await pathExists(dbPath))) return [];
+  const safeLimit = Math.max(1, Math.min(80, Number(limit) || 30));
+  const sql = [
+    '.mode json',
+    `SELECT path, snippet(file_index, 1, '[', ']', ' ... ', 12) AS snippet`,
+    `FROM file_index WHERE file_index MATCH ${sqlString(query)}`,
+    `LIMIT ${safeLimit};`
+  ].join('\n');
+  const result = await runSqlite(dbPath, sql);
+  if (result.code !== 0) return [];
+  try {
+    return JSON.parse(result.stdout || '[]');
+  } catch {
+    return [];
+  }
+}
+
+function classifyCommand(command = '') {
+  const text = String(command || '').trim();
+  const lower = text.toLowerCase();
+  if (!text) return { classification: 'blocked', reason: 'Empty command.' };
+  if (/(^|\s)(rm\s+-rf|git\s+reset\s+--hard|sudo\b|chmod\s+-r|chown\s+-r)\b/i.test(text)) {
+    return { classification: 'blocked', reason: 'Destructive command blocked by Anton policy.' };
+  }
+  if (/(curl|wget).*(token|secret|password|authorization)|(\.env|id_rsa).*(curl|wget|scp|nc)/i.test(text)) {
+    return { classification: 'blocked', reason: 'Command resembles credential exfiltration.' };
+  }
+  if (/[>|;&]|\|\||&&/.test(text) || /\b(npm\s+install|pnpm\s+install|yarn\s+add|git\s+(push|pull|checkout|commit|reset|clean|stash)|kill|pkill|rm|mv|cp|scp|curl|wget)\b/i.test(lower)) {
+    return { classification: 'needs_approval', reason: 'Command can mutate files, access network, or chain shell operations.' };
+  }
+  if (/^(pwd|ls|find|rg|grep|cat|sed -n|git status|git diff|npm run (test|check|typecheck|lint|build)|npm test|node --check)\b/i.test(text)) {
+    return { classification: 'safe', reason: 'Read-only or project verification command.' };
+  }
+  return { classification: 'needs_approval', reason: 'Unknown command requires approval.' };
+}
+
+async function detectVerificationPlan() {
+  if (!workspaceRoot) throw new Error('Open a workspace first.');
+  const packagePath = path.join(workspaceRoot, 'package.json');
+  const scripts = {};
+  let projectType = 'generic';
+  try {
+    const parsed = JSON.parse(await fs.readFile(packagePath, 'utf8'));
+    Object.assign(scripts, parsed.scripts || {});
+    const deps = { ...(parsed.dependencies || {}), ...(parsed.devDependencies || {}) };
+    if (deps.vite || await pathExists(path.join(workspaceRoot, 'vite.config.ts')) || await pathExists(path.join(workspaceRoot, 'vite.config.js'))) projectType = 'vite';
+    else if (deps.next || await pathExists(path.join(workspaceRoot, 'next.config.js')) || await pathExists(path.join(workspaceRoot, 'next.config.mjs'))) projectType = 'next';
+    else if (deps.react) projectType = 'react';
+  } catch {
+    // Non-node project.
+  }
+  const sequence = [];
+  for (const name of ['typecheck', 'lint', 'test', 'check', 'build']) {
+    if (typeof scripts[name] === 'string' && scripts[name].trim()) {
+      sequence.push(name === 'test' ? 'npm test' : `npm run ${name}`);
+    }
+  }
+  if (!sequence.length && scripts.build) sequence.push('npm run build');
+  return {
+    projectType,
+    scripts,
+    commands: [...new Set(sequence)],
+    browserCapable: ['vite', 'next', 'react'].includes(projectType)
+  };
+}
+
+function verificationHasSeriousWarning(output = '') {
+  return /\b(error|failed|syntax-error|parse error|unterminated|string token|expected identifier|cannot find module|module not found|ts\d{4}|type error)\b/i.test(output);
+}
+
+function validatePendingSourceContent(relativePath, content) {
+  const text = String(content || '');
+  if (/"editedCode"\s*:/.test(text) || /^\s*```/m.test(text)) {
+    throw new Error(`Refusing pending edit for ${relativePath}: source contains model wrapper artifacts.`);
+  }
+  if (/\.jsonc?$/i.test(relativePath)) {
+    JSON.parse(text);
+  }
+  if (/\.css$/i.test(relativePath)) {
+    const quoteCount = (text.match(/"/g) || []).length;
+    if (quoteCount % 2 !== 0) {
+      throw new Error(`Refusing pending edit for ${relativePath}: unterminated string token.`);
+    }
+  }
+}
+
+async function runVerificationPlan() {
+  const plan = await detectVerificationPlan();
+  const results = [];
+  for (const command of plan.commands) {
+    const result = await new Promise((resolve) => {
+      const child = spawnUserCommand(command, { cwd: workspaceRoot });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+      child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+      child.on('close', (code) => {
+        const output = `${stdout}\n${stderr}`.trim();
+        resolve({ command, code, stdout, stderr, seriousWarnings: verificationHasSeriousWarning(output) });
+      });
+      child.on('error', (error) => resolve({ command, code: 1, stdout, stderr: error.message, seriousWarnings: true }));
+    });
+    results.push(result);
+    if (result.code !== 0 || result.seriousWarnings) break;
+  }
+  return {
+    ...plan,
+    results,
+    ok: results.length > 0 && results.every((result) => result.code === 0 && !result.seriousWarnings)
+  };
+}
+
+function findDevServerUrlFromText(text = '') {
+  const match = String(text).match(/https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):\d+[^\s"'<>)]*/i) ||
+    String(text).match(/\b(?:localhost|127\.0\.0\.1):\d+[^\s"'<>)]*/i);
+  if (!match) return '';
+  return match[0].startsWith('http') ? match[0] : `http://${match[0]}`;
+}
+
+async function ensureBrowserVerificationServer(timeoutMs = 12000) {
+  if (browserVerificationServer?.process && !browserVerificationServer.process.killed) {
+    return browserVerificationServer.url || findDevServerUrlFromText(browserVerificationServer.output || '');
+  }
+  const plan = await detectVerificationPlan();
+  if (!plan.scripts?.dev) return '';
+
+  return new Promise((resolve) => {
+    const child = spawnUserCommand('npm run dev', { cwd: workspaceRoot });
+    const server = {
+      process: child,
+      url: '',
+      output: '',
+      startedAt: new Date().toISOString()
+    };
+    browserVerificationServer = server;
+    let settled = false;
+    const finish = (url = '') => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      server.url = url;
+      resolve(url);
+    };
+    const handleChunk = (chunk) => {
+      server.output += chunk.toString();
+      const url = findDevServerUrlFromText(server.output);
+      if (url) finish(url);
+    };
+    const timer = setTimeout(() => finish(server.url || findDevServerUrlFromText(server.output)), timeoutMs);
+    child.stdout.on('data', handleChunk);
+    child.stderr.on('data', handleChunk);
+    child.on('close', () => {
+      if (browserVerificationServer === server) browserVerificationServer = null;
+      finish(server.url || findDevServerUrlFromText(server.output));
+    });
+    child.on('error', () => {
+      if (browserVerificationServer === server) browserVerificationServer = null;
+      finish('');
+    });
+  });
+}
+
+async function verifyBrowser({ url, timeoutMs = 8000 } = {}) {
+  const detectedUrl = url || await ensureBrowserVerificationServer(Math.max(timeoutMs, 12000));
+  const targetUrl = detectedUrl || 'http://127.0.0.1:5173';
+  const result = { url: targetUrl, ok: false, errors: [], warnings: [], screenshotPath: '' };
+  try {
+    const playwright = require('playwright');
+    const browser = await playwright.chromium.launch({ headless: true });
+    const page = await browser.newPage();
+    page.on('console', (message) => {
+      if (message.type() === 'error') result.errors.push(message.text());
+      if (message.type() === 'warning') result.warnings.push(message.text());
+    });
+    page.on('pageerror', (error) => result.errors.push(error.message));
+    const response = await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: timeoutMs });
+    const shotDir = path.join(app.getPath('userData'), 'browser-verification');
+    await fs.mkdir(shotDir, { recursive: true });
+    result.screenshotPath = path.join(shotDir, `${Date.now()}.png`);
+    await page.screenshot({ path: result.screenshotPath, fullPage: true });
+    result.status = response?.status?.() || 0;
+    result.ok = Boolean(response && response.ok()) && !result.errors.length;
+    await browser.close();
+    return result;
+  } catch (error) {
+    try {
+      const response = await fetchWithTimeout(targetUrl, {}, timeoutMs);
+      result.status = response.status;
+      result.ok = response.ok;
+      if (!response.ok) result.errors.push(`HTTP ${response.status}`);
+    } catch (fallbackError) {
+      result.errors.push(error.message || String(error));
+      result.errors.push(`HTTP fallback failed: ${fallbackError.message}`);
+    }
+    return result;
   }
 }
 
@@ -927,6 +1288,150 @@ ipcMain.handle('workspace:search', async (_event, query) => {
     });
 });
 
+ipcMain.handle('index:rebuild', async () => rebuildWorkspaceIndex());
+
+ipcMain.handle('index:search', async (_event, { query, limit } = {}) => searchWorkspaceIndex(query, limit));
+
+ipcMain.handle('index:status', async () => {
+  if (!workspaceRoot) return { status: 'no-workspace', fileCount: 0 };
+  return workspaceIndexState.get(workspaceRoot) || {
+    status: await pathExists(indexDbPath()) ? 'ready' : 'missing',
+    fileCount: 0,
+    updatedAt: null,
+    dbPath: indexDbPath()
+  };
+});
+
+ipcMain.handle('command:classify', async (_event, { command } = {}) => classifyCommand(command));
+
+async function createSnapshot({ files, prompt = '', model = '', verification = null } = {}) {
+  if (!workspaceRoot) throw new Error('Open a workspace first.');
+  const id = `${Date.now()}-${crypto.randomBytes(5).toString('hex')}`;
+  const dir = path.join(snapshotsDir(), id);
+  await fs.mkdir(dir, { recursive: true });
+  const entries = [];
+  for (const relative of files || []) {
+    const absolutePath = safeWorkspaceFilePath(relative);
+    let content = '';
+    let existed = true;
+    try {
+      content = await fs.readFile(absolutePath, 'utf8');
+    } catch {
+      existed = false;
+      content = '';
+    }
+    const snapshotPath = path.join(dir, relative);
+    await fs.mkdir(path.dirname(snapshotPath), { recursive: true });
+    await fs.writeFile(snapshotPath, content, 'utf8');
+    entries.push({ path: relative, snapshotPath, existed });
+  }
+  const metadata = {
+    id,
+    workspaceRoot,
+    prompt,
+    model,
+    verification,
+    files: entries.map((entry) => entry.path),
+    entries: entries.map((entry) => ({ path: entry.path, existed: entry.existed })),
+    createdAt: new Date().toISOString()
+  };
+  await fs.writeFile(path.join(dir, 'snapshot.json'), JSON.stringify(metadata, null, 2), 'utf8');
+  return metadata;
+}
+
+ipcMain.handle('snapshot:create', async (_event, payload = {}) => createSnapshot(payload));
+
+ipcMain.handle('snapshot:list', async () => {
+  if (!workspaceRoot) return [];
+  const dir = snapshotsDir();
+  try {
+    const ids = await fs.readdir(dir);
+    const snapshots = [];
+    for (const id of ids) {
+      try {
+        const raw = await fs.readFile(path.join(dir, id, 'snapshot.json'), 'utf8');
+        snapshots.push(JSON.parse(raw));
+      } catch {
+        // Skip malformed snapshot metadata.
+      }
+    }
+    return snapshots.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  } catch {
+    return [];
+  }
+});
+
+ipcMain.handle('snapshot:restore', async (_event, { snapshotId } = {}) => {
+  if (!workspaceRoot) throw new Error('Open a workspace first.');
+  if (!snapshotId) throw new Error('Snapshot id is required.');
+  const dir = path.join(snapshotsDir(), snapshotId);
+  const metadata = JSON.parse(await fs.readFile(path.join(dir, 'snapshot.json'), 'utf8'));
+  const entries = Array.isArray(metadata.entries) && metadata.entries.length
+    ? metadata.entries
+    : (metadata.files || []).map((relative) => ({ path: relative, existed: true }));
+  for (const entry of entries) {
+    const relative = entry.path;
+    const snapshotPath = path.join(dir, relative);
+    const targetPath = safeWorkspaceFilePath(relative);
+    if (entry.existed === false) {
+      await fs.rm(targetPath, { force: true });
+    } else {
+      await fs.mkdir(path.dirname(targetPath), { recursive: true });
+      await fs.copyFile(snapshotPath, targetPath);
+    }
+  }
+  return { restored: metadata.files || [], snapshot: metadata, workspace: await openWorkspace(workspaceRoot) };
+});
+
+ipcMain.handle('agent:createPendingEdit', async (_event, { path: relativePath, content, prompt = '', model = '', source = 'agent' } = {}) => {
+  if (typeof content !== 'string') throw new Error('Pending edit content must be a string.');
+  const absolutePath = safeWorkspaceFilePath(relativePath);
+  const normalizedPath = workspaceRelativePath(absolutePath);
+  validatePendingSourceContent(normalizedPath, content);
+  let original = '';
+  try {
+    original = await fs.readFile(absolutePath, 'utf8');
+  } catch {
+    original = '';
+  }
+  const id = `${Date.now()}-${crypto.randomBytes(5).toString('hex')}`;
+  const pending = {
+    id,
+    path: normalizedPath,
+    original,
+    content,
+    prompt,
+    model,
+    source,
+    createdAt: new Date().toISOString()
+  };
+  pendingEdits.set(id, pending);
+  return pending;
+});
+
+ipcMain.handle('agent:applyPendingEdit', async (_event, { id, prompt = '', model = '' } = {}) => {
+  const pending = pendingEdits.get(id);
+  if (!pending) throw new Error('Pending edit was not found.');
+  validatePendingSourceContent(pending.path, pending.content);
+  const snapshot = await createSnapshot({ files: [pending.path], prompt: prompt || pending.prompt, model: model || pending.model });
+  const targetPath = safeWorkspaceFilePath(pending.path);
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  await fs.writeFile(targetPath, pending.content, 'utf8');
+  pendingEdits.delete(id);
+  return { applied: pending.path, snapshot, file: await readFile(targetPath), workspace: await openWorkspace(workspaceRoot) };
+});
+
+ipcMain.handle('agent:rejectPendingEdit', async (_event, { id } = {}) => {
+  const existed = pendingEdits.delete(id);
+  return { rejected: existed };
+});
+
+ipcMain.handle('verify:detect', async () => detectVerificationPlan());
+
+ipcMain.handle('verify:run', async () => runVerificationPlan());
+
+ipcMain.handle('browser:verify', async (_event, payload = {}) => verifyBrowser(payload));
+
 async function gitStatusForRepo(repoRoot) {
   const gitCwd = await assertGitRepo(repoRoot);
   const repositories = await findGitRepositories();
@@ -1229,6 +1734,127 @@ ipcMain.handle('ollama:deleteModel', async (_event, { name }) => {
   return { deleted: name };
 });
 
+ipcMain.handle('openclaw:getModelInfo', async () => {
+  let primary = '';
+  const models = new Set();
+  try {
+    const os = require('node:os');
+    const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
+    if (fsNative.existsSync(configPath)) {
+      const config = JSON.parse(fsNative.readFileSync(configPath, 'utf8'));
+      primary = config?.agents?.defaults?.model?.primary || '';
+      
+      const providers = config?.models?.providers || {};
+      for (const [providerName, providerData] of Object.entries(providers)) {
+        const providerModels = providerData?.models || [];
+        for (const model of providerModels) {
+          if (model?.id) models.add(`${providerName}/${model.id}`);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Failed to get OpenClaw model info:', e);
+  }
+  const localModels = await listLocalOllamaModelNames({ startIfNeeded: false });
+  for (const modelName of localModels) {
+    models.add(`ollama/${modelName}`);
+  }
+  if (primary && !models.has(primary)) models.add(primary);
+  return { primary, models: Array.from(models).sort((a, b) => a.localeCompare(b)) };
+});
+
+function openClawConfigPath() {
+  const os = require('node:os');
+  return path.join(os.homedir(), '.openclaw', 'openclaw.json');
+}
+
+function setOpenClawPrimaryModel(selectedModel) {
+  const configPath = openClawConfigPath();
+  const config = fsNative.existsSync(configPath)
+    ? JSON.parse(fsNative.readFileSync(configPath, 'utf8'))
+    : {};
+  if (!config.agents) config.agents = {};
+  if (!config.agents.defaults) config.agents.defaults = {};
+  if (!config.agents.defaults.model) config.agents.defaults.model = {};
+  if (!config.agents.defaults.models) config.agents.defaults.models = {};
+
+  config.agents.defaults.model.primary = selectedModel;
+  if (selectedModel) config.agents.defaults.models[selectedModel] = config.agents.defaults.models[selectedModel] || {};
+
+  const slashIndex = String(selectedModel || '').indexOf('/');
+  const providerName = slashIndex > 0 ? selectedModel.slice(0, slashIndex) : '';
+  const modelId = slashIndex > 0 ? selectedModel.slice(slashIndex + 1) : '';
+  if (providerName && modelId) {
+    if (!config.models) config.models = {};
+    if (!config.models.providers) config.models.providers = {};
+    if (!config.models.providers[providerName]) {
+      config.models.providers[providerName] = { models: [] };
+    }
+    const provider = config.models.providers[providerName];
+    if (!Array.isArray(provider.models)) provider.models = [];
+    if (!provider.models.some((model) => model?.id === modelId)) {
+      provider.models.push({ id: modelId });
+    }
+  }
+
+  config.meta = config.meta || {};
+  config.meta.lastTouchedAt = new Date().toISOString();
+
+  fsNative.mkdirSync(path.dirname(configPath), { recursive: true });
+  fsNative.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+  return true;
+}
+
+ipcMain.handle('openclaw:setModel', async (_event, selectedModel) => {
+  try {
+    setOpenClawPrimaryModel(selectedModel);
+    return true;
+  } catch (e) {
+    console.error('Failed to set OpenClaw model:', e);
+  }
+  return false;
+});
+
+ipcMain.handle('openclaw:send', async (_event, { endpoint, model, messages }) => {
+  const selectedModel = String(model || '').trim();
+  if (!endpoint) throw new Error('API Endpoint is required.');
+  if (selectedModel) {
+    setOpenClawPrimaryModel(selectedModel);
+  }
+  
+  // Try to find the local OpenClaw token dynamically from ~/.openclaw/openclaw.json
+  let token = '';
+  try {
+    const os = require('node:os');
+    const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
+    if (fsNative.existsSync(configPath)) {
+      const config = JSON.parse(fsNative.readFileSync(configPath, 'utf8'));
+      token = config?.gateway?.auth?.token || '';
+    }
+  } catch (e) {
+    console.error('Failed to read OpenClaw config:', e);
+  }
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model: 'openclaw',
+      messages
+    })
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(errorText || `HTTP error! status: ${response.status}`);
+  }
+  return await response.json();
+});
+
 ipcMain.handle('ollama:pullModel', async (event, { name, requestId }) => {
   if (!name || typeof name !== 'string') throw new Error('Model name is required.');
   await ensureOllamaReady();
@@ -1276,9 +1902,18 @@ ipcMain.handle('ollama:abort', async (_event, requestId) => {
   return true;
 });
 
-ipcMain.handle('ollama:generate', async (event, { model, prompt, stream = true, requestId, format, timeoutMs }) => {
+ipcMain.handle('ollama:generate', async (event, { model, prompt, stream = true, requestId, format, timeoutMs, options = {} }) => {
   await ensureOllamaReady();
-  const payload = { model, prompt, stream };
+  const payload = {
+    model,
+    prompt,
+    stream,
+    options: {
+      temperature: 0.15,
+      num_ctx: 32768,
+      ...options
+    }
+  };
   if (format) payload.format = format;
   const controller = new AbortController();
   if (requestId) activeOllamaControllers.set(requestId, controller);
